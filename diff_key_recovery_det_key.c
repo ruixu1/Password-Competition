@@ -444,68 +444,91 @@ int main() {
 		encrypt(plain[i], cipher[i], key_schedule, aes_table, matrix_sol_table);
     }
 
-    // 7. 得到2^{32}种全部可能的候选子密钥， 并且和生成的明文加密验证得到正确子密钥
-     // 7. 得到2^{32}种全部可能的候选子密钥， 并且和生成的明文加密验证得到正确子密钥
+    // 7. 得到2^{32}种全部可能的候选子密钥，并且和生成的明文加密验证得到正确子密钥
     clock_t start = clock();
     State key_cand_right = { 0xE3, 0x6C, 0xDB, 0xBF, 0x7F, 0x05, 0x91, 0x05, 0xCF, 0xCC, 0x94, 0x27, 0x02, 0x3D, 0xB9, 0xC2 };
-    State key_cand;
 
-    for (uint64_t i = 0; i < ((uint64_t)1 << 32); ++i) {
-        int index[8];
-        for (int j = 0; j < 8; ++j) {
-            index[j] = (i >> 4 * j) & 0xF; // 取低4位作为索引
-        }
-        uint8_t temp[16];
-        temp[0] = cand_key_0[index[0]][0] & 0xFF;
-        temp[1] = (cand_key_0[index[0]][0] >> 8) & 0xFF;
-        temp[2] = cand_key_1[index[1]][0] & 0xFF;
-        temp[3] = (cand_key_1[index[1]][0] >> 8) & 0xFF;
-        temp[4] = cand_key_2[index[2]][0] & 0xFF;
-        temp[5] = (cand_key_2[index[2]][0] >> 8) & 0xFF;
-        temp[6] = cand_key_3[index[3]][0] & 0xFF;
-        temp[7] = (cand_key_3[index[3]][0] >> 8) & 0xFF;
-        temp[8] = cand_key_4[index[4]][0] & 0xFF;
-        temp[9] = (cand_key_4[index[4]][0] >> 8) & 0xFF;
-        temp[10] = cand_key_5[index[5]][0] & 0xFF;
-        temp[11] = (cand_key_5[index[5]][0] >> 8) & 0xFF;
-        temp[12] = cand_key_6[index[6]][0] & 0xFF;
-        temp[13] = (cand_key_6[index[6]][0] >> 8) & 0xFF;
-        temp[14] = cand_key_7[index[7]][0] & 0xFF;
-        temp[15] = (cand_key_7[index[7]][0] >> 8) & 0xFF;
-        for (int j = 0; j < 8; ++j) {
-            for (int k = 0; k < 2; ++k) {
-                key_cand[index_inv[index_diff_word[j][k]]] = temp[2 * j + k];
-            }
-        }
+    volatile int found = 0;         // 标志位，线程安全
+    uint64_t result_index = 0;
+    uint8_t result_key[16] = { 0 };
 
+    #pragma omp parallel
+    {
+        State key_cand_local;  // 每个线程自己的key_cand
         KeySchedule key_schedule_inv;
-        aes_key_schedule_invert(key_cand, matrix_sol_table, key_schedule_inv);
-
-        // 使用key_schedule_inv验证明密文对
         uint8_t cipher_cand[10][STATE_SIZE];
-        bool match = true;
-        for (int j = 0; j < 10; ++j) {
-            encrypt(plain[j], cipher_cand[j], key_schedule_inv, aes_table, matrix_sol_table);
-            match = true;
-            for (int k = 0; k < 16; ++k) {
-                if (cipher_cand[j][k] != cipher[j][k]) {
-                    match = false;
-                    break;
+
+        #pragma omp for schedule(static)
+        for (uint64_t i = 0; i < ((uint64_t)1 << 32); ++i) {
+            if (found) continue; // 其他线程已经找到
+
+            int index[8];
+            for (int j = 0; j < 8; ++j) {
+                index[j] = (i >> (4 * j)) & 0xF; // 注意加括号
+            }
+            uint8_t temp[16];
+            temp[0] = cand_key_0[index[0]][0] & 0xFF;
+            temp[1] = (cand_key_0[index[0]][0] >> 8) & 0xFF;
+            temp[2] = cand_key_1[index[1]][0] & 0xFF;
+            temp[3] = (cand_key_1[index[1]][0] >> 8) & 0xFF;
+            temp[4] = cand_key_2[index[2]][0] & 0xFF;
+            temp[5] = (cand_key_2[index[2]][0] >> 8) & 0xFF;
+            temp[6] = cand_key_3[index[3]][0] & 0xFF;
+            temp[7] = (cand_key_3[index[3]][0] >> 8) & 0xFF;
+            temp[8] = cand_key_4[index[4]][0] & 0xFF;
+            temp[9] = (cand_key_4[index[4]][0] >> 8) & 0xFF;
+            temp[10] = cand_key_5[index[5]][0] & 0xFF;
+            temp[11] = (cand_key_5[index[5]][0] >> 8) & 0xFF;
+            temp[12] = cand_key_6[index[6]][0] & 0xFF;
+            temp[13] = (cand_key_6[index[6]][0] >> 8) & 0xFF;
+            temp[14] = cand_key_7[index[7]][0] & 0xFF;
+            temp[15] = (cand_key_7[index[7]][0] >> 8) & 0xFF;
+            for (int j = 0; j < 8; ++j) {
+                for (int k = 0; k < 2; ++k) {
+                    key_cand_local[index_inv[index_diff_word[j][k]]] = temp[2 * j + k];
                 }
             }
-            if (!match) {
-                break;
-            }
-        }
 
-        if (match) {
-            printf("The correct index is : %" PRIu64 "\n", i);
-            printf("The correct sub key is : ");
-            for (int j = 0; j < 16; ++j) {
-                printf("0x%02X, ", key_cand[j]);
+            aes_key_schedule_invert(key_cand_local, matrix_sol_table, key_schedule_inv);
+
+            // 使用key_schedule_inv验证明密文对
+            bool match = true;
+            for (int j = 0; j < 10; ++j) {
+                encrypt(plain[j], cipher_cand[j], key_schedule_inv, aes_table, matrix_sol_table);
+                match = true;
+                for (int k = 0; k < 16; ++k) {
+                    if (cipher_cand[j][k] != cipher[j][k]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (!match) break;
             }
-            break;
+
+            if (match) {
+                // 抢答写全局结果
+                #pragma omp critical
+                {
+                    if (!found) {
+                        found = 1;
+                        result_index = i;
+                        memcpy(result_key, key_cand_local, 16);
+                    }
+                }
+            }
         }
+    }
+
+    if (found) {
+        printf("The correct index is : %" PRIu64 "\n", result_index);
+        printf("The correct sub key is : ");
+        for (int j = 0; j < 16; ++j) {
+            printf("0x%02X, ", result_key[j]);
+        }
+        printf("\n");
+    }
+    else {
+        printf("No matching key found.\n");
     }
 
     clock_t end = clock();
