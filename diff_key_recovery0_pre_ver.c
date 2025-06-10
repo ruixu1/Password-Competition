@@ -12,7 +12,6 @@
 #define BYTE_SIZE 8
 #define MAX_LINE_LENGTH 1024
 #define MAX_PAIRS (1ULL<<32)
-#define MAX_FILTERED_PAIRS 10000  // 最多在内存中保留多少对通过筛选的明密文对
 #define round 100
 
 // Type definitions
@@ -37,11 +36,8 @@ void shift_rows(State state);
 void build_table_aes(uint8_t* sbox_table, uint8_t* time_table, uint8_t**** aes_table);
 void generate_rcon(uint8_t* rcon);
 void key_expansion(const uint8_t* key, uint8_t* table, KeySchedule round_keys);
-void generate_pair(StatePair pair, const int* diff_word,
-    const int* diff_bits);
-void encrypt(State plaintext, State ciphertext, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table);
-bool pass_filter(State c1, State c2, const uint8_t diff_output[16]);
-void generate_encrypt_and_filter_stream(size_t num_pairs, const int* diff_word, const int* diff_bits, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table, const uint8_t diff_output[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count);
+void generate_structure(StatePair* pairs, int num_pairs, const int* diff_word, const int* diff_bits);
+void encrypt_and_filter(StatePair* pairs, int num_pairs, const KeySchedule key_schedule, uint8_t*** aes_table, const uint8_t diff_output[16], StatePair* pairs_cand1, StatePair* pairs_cand, int* pairs_cand_count, uint8_t* matrix_sol_table);
 void guess_subkeys(const uint8_t matrix_sol_table[256], const StatePair* pairs_cand, int pairs_cand_count, const uint8_t diff_output[16], const int index_diff_word[2], int* max_val, int* max_index_count, int* max_index);
 
 
@@ -286,123 +282,145 @@ void key_expansion(const uint8_t* key, uint8_t* table, KeySchedule round_keys) {
 }
 
 // 生成随机明文结构
-void generate_pair(StatePair pair, const int* diff_word,
+void generate_structure(StatePair* pairs, int num_pairs, const int* diff_word,
     const int* diff_bits) {
-    for (int j = 0; j < STATE_SIZE; j++) {
-        uint8_t v = rand() & 0xFF;
+    for (int i = 0; i < num_pairs; i++) {
+        for (int j = 0; j < STATE_SIZE; j++) {
+            uint8_t v = rand() & 0xFF;
 
-        if (diff_word[j] == 1) {
-            uint8_t delta = 0;
-            for (int bit = 0; bit < 8; bit++) {
-                if (diff_bits[j * 8 + bit]) {
-                    delta |= (1 << bit);
+            if (diff_word[j] == 1) {
+                uint8_t delta = 0;
+                for (int bit = 0; bit < 8; bit++) {
+                    if (diff_bits[j * 8 + bit]) {
+                        delta |= (1 << bit);
+                    }
                 }
+                pairs[i].first[j] = v;
+                pairs[i].second[j] = v ^ delta;
             }
-            pair.first[j] = v;
-            pair.second[j] = v ^ delta;
-        }
-        else {
-            pair.first[j] = pair.second[j] = v;
+            else {
+                pairs[i].first[j] = pairs[i].second[j] = v;
+            }
         }
     }
-}
-
-// round轮aes加密
-void encrypt(State plaintext, State ciphertext, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table) {
-    memcpy(ciphertext, plaintext, STATE_SIZE);
-    // XOR with initial key
-    for (int j = 0; j < 16; ++j) {
-        ciphertext[j] ^= key_schedule[0][j];
-    }
-
-    // Perform AES rounds
-    for (int r = 0; r < round; ++r) {
-        State c_temp;
-        memcpy(c_temp, ciphertext, STATE_SIZE);
-
-        for (int j = 0; j < 4; ++j) {
-            ciphertext[j] = aes_table[0][j][c_temp[0]] ^ aes_table[1][j][c_temp[5]] ^
-                aes_table[2][j][c_temp[10]] ^ aes_table[3][j][c_temp[15]];
-            ciphertext[j + 4] = aes_table[0][j][c_temp[4]] ^ aes_table[1][j][c_temp[9]] ^
-                aes_table[2][j][c_temp[14]] ^ aes_table[3][j][c_temp[3]];
-            ciphertext[j + 8] = aes_table[0][j][c_temp[8]] ^ aes_table[1][j][c_temp[13]] ^
-                aes_table[2][j][c_temp[2]] ^ aes_table[3][j][c_temp[7]];
-            ciphertext[j + 12] = aes_table[0][j][c_temp[12]] ^ aes_table[1][j][c_temp[1]] ^
-                aes_table[2][j][c_temp[6]] ^ aes_table[3][j][c_temp[11]];
-        }
-
-        for (int j = 0; j < 16; ++j) {
-            ciphertext[j] ^= key_schedule[r + 1][j];
-        }
-    }
-
-    // Final round
-    sub_bytes(ciphertext, matrix_sol_table);
-    shift_rows(ciphertext);
-    for (int j = 0; j < 16; ++j) {
-        ciphertext[j] ^= key_schedule[round + 1][j];
-    }
-}
-
-// 判断一对加密后是否满足差分（你原本的逻辑）
-bool pass_filter(State c1, State c2, const uint8_t diff_output[16]) {
-    for (int i = 0; i < STATE_SIZE; ++i) {
-        if ((c1[i] ^ c2[i]) != diff_output[i]) return false;
-    }
-    return true;
 }
 
 // 单独将加密过程和筛选密文过程分离出来
-void generate_encrypt_and_filter_stream(size_t num_pairs, const int* diff_word, const int* diff_bits, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table, const uint8_t diff_output[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count) {
+void encrypt_and_filter(StatePair* pairs, int num_pairs, const KeySchedule key_schedule, uint8_t*** aes_table, const uint8_t diff_output[16], StatePair* pairs_cand1, StatePair* pairs_cand, int* pairs_cand_count, uint8_t* matrix_sol_table) {
     int max_threads = omp_get_max_threads();
     // 每个线程用私有buffer, 以免冲突
-    StatePair** thread_buffers = malloc(max_threads * sizeof(StatePair*));
-    size_t* thread_counts = calloc(max_threads, sizeof(size_t));
-    size_t thread_bufsize = max_filtered_count / max_threads + 10000;
+    StatePair** local_cand1_array = malloc(max_threads * sizeof(StatePair*));
+    StatePair** local_cand_array = malloc(max_threads * sizeof(StatePair*));
+    int* local_count = calloc(max_threads, sizeof(int));
+
     for (int t = 0; t < max_threads; ++t) {
-        thread_buffers[t] = malloc(thread_bufsize * sizeof(StatePair));
+        local_cand1_array[t] = malloc(num_pairs * sizeof(StatePair));
+        local_cand_array[t] = malloc(num_pairs * sizeof(StatePair));
     }
 
     #pragma omp parallel
     {
         int tid = omp_get_thread_num();
-        StatePair* local_buf = thread_buffers[tid];
-        size_t local_count = 0;
+        int local_idx = 0;
+        StatePair* local_cand1 = local_cand1_array[tid];
+        StatePair* local_cand = local_cand_array[tid];
 
-        // 每个线程使用自己独立的随机数种子，确保不同线程生成的明文对不同
-        unsigned int seed = (unsigned int)(time(NULL) ^ (tid * 7919));
         #pragma omp for schedule(static)
-        for (uint64_t i = 0; i < num_pairs; ++i) {
-            StatePair pair;
-            generate_pair(pair, diff_word, diff_bits);
-
+        for (int i = 0; i < num_pairs; ++i) {
             State c1, c2;
-            encrypt(pair.first, c1, key_schedule, aes_table, matrix_sol_table);
-            encrypt(pair.second, c2, key_schedule, aes_table, matrix_sol_table);
+            memcpy(c1, pairs[i].first, STATE_SIZE);
+            memcpy(c2, pairs[i].second, STATE_SIZE);
 
-            if (pass_filter(c1, c2, diff_output)) {
-                // 保存明密文对
-                for (int k = 0; k < STATE_SIZE; ++k) {
-                    local_buf[local_count].first[k] = pair.first[k];
-                    local_buf[local_count].second[k] = pair.second[k];
+            // XOR with initial key
+            for (int j = 0; j < 16; ++j) {
+                c1[j] ^= key_schedule[0][j];
+                c2[j] ^= key_schedule[0][j];
+            }
+
+            // Perform AES rounds
+            for (int r = 0; r < round; ++r) {
+                State c1_temp, c2_temp;
+                memcpy(c1_temp, c1, STATE_SIZE);
+                memcpy(c2_temp, c2, STATE_SIZE);
+
+                for (int j = 0; j < 4; ++j) {
+                    c1[j] = aes_table[0][j][c1_temp[0]] ^ aes_table[1][j][c1_temp[5]] ^
+                        aes_table[2][j][c1_temp[10]] ^ aes_table[3][j][c1_temp[15]];
+                    c1[j + 4] = aes_table[0][j][c1_temp[4]] ^ aes_table[1][j][c1_temp[9]] ^
+                        aes_table[2][j][c1_temp[14]] ^ aes_table[3][j][c1_temp[3]];
+                    c1[j + 8] = aes_table[0][j][c1_temp[8]] ^ aes_table[1][j][c1_temp[13]] ^
+                        aes_table[2][j][c1_temp[2]] ^ aes_table[3][j][c1_temp[7]];
+                    c1[j + 12] = aes_table[0][j][c1_temp[12]] ^ aes_table[1][j][c1_temp[1]] ^
+                        aes_table[2][j][c1_temp[6]] ^ aes_table[3][j][c1_temp[11]];
+
+                    c2[j] = aes_table[0][j][c2_temp[0]] ^ aes_table[1][j][c2_temp[5]] ^
+                        aes_table[2][j][c2_temp[10]] ^ aes_table[3][j][c2_temp[15]];
+                    c2[j + 4] = aes_table[0][j][c2_temp[4]] ^ aes_table[1][j][c2_temp[9]] ^
+                        aes_table[2][j][c2_temp[14]] ^ aes_table[3][j][c2_temp[3]];
+                    c2[j + 8] = aes_table[0][j][c2_temp[8]] ^ aes_table[1][j][c2_temp[13]] ^
+                        aes_table[2][j][c2_temp[2]] ^ aes_table[3][j][c2_temp[7]];
+                    c2[j + 12] = aes_table[0][j][c2_temp[12]] ^ aes_table[1][j][c2_temp[1]] ^
+                        aes_table[2][j][c2_temp[6]] ^ aes_table[3][j][c2_temp[11]];
                 }
-                local_count++;
-                // 如果local_count超了thread_bufsize，可以扩容，实际通常不会超
+
+                for (int j = 0; j < 16; ++j) {
+                    c1[j] ^= key_schedule[r + 1][j];
+                    c2[j] ^= key_schedule[r + 1][j];
+                }
+            }
+
+            // Final round
+            State c1_temp, c2_temp;
+            memcpy(c1_temp, c1, STATE_SIZE);
+            memcpy(c2_temp, c2, STATE_SIZE);
+            sub_bytes(c1, matrix_sol_table);
+            shift_rows(c1);
+            for (int j = 0; j < 16; ++j) {
+                c1[j] ^= key_schedule[round + 1][j];
+            }
+
+            sub_bytes(c2, matrix_sol_table);
+            shift_rows(c2);
+            for (int j = 0; j < 16; ++j) {
+                c2[j] ^= key_schedule[round + 1][j];
+            }
+
+            // Compare output difference
+            bool flag = true;
+            for (int j = 0; j < 16; ++j) {
+                if ((c1[j] ^ c2[j]) != diff_output[j]) {
+                    flag = false;
+                    break;
+                }
+            }
+
+            if (flag) {
+                memcpy(local_cand1[local_idx].first, c1_temp, STATE_SIZE);
+                memcpy(local_cand1[local_idx].second, c2_temp, STATE_SIZE);
+                memcpy(local_cand[local_idx].first, c1, STATE_SIZE);
+                memcpy(local_cand[local_idx].second, c2, STATE_SIZE);
+                local_idx++;
             }
         }
-        thread_counts[tid] = local_count;
+        local_count[tid] = local_idx;
     }
 
-    // 合并所有线程buffer到全局
-    *filtered_count = 0;
+    // 合并所有线程buffer到全局数组
+    int total = 0;
     for (int t = 0; t < max_threads; ++t) {
-        for (size_t i = 0; i < thread_counts[t]; ++i) {
-            filtered_pairs[(*filtered_count)++] = thread_buffers[t][i];
+        if (local_count[t] > 0) {
+            memcpy(&pairs_cand1[total], local_cand1_array[t], local_count[t] * sizeof(StatePair));
+            memcpy(&pairs_cand[total], local_cand_array[t], local_count[t] * sizeof(StatePair));
+            total += local_count[t];
         }
-        free(thread_buffers[t]);
+        free(local_cand1_array[t]);
+        free(local_cand_array[t]);
     }
-    free(thread_buffers);
-    free(thread_counts);
+    free(local_cand1_array);
+    free(local_cand_array);
+    free(local_count);
+
+    *pairs_cand_count = total;
 }
 
 // 单独将猜测子密钥过程分离出来
@@ -507,22 +525,24 @@ int main() {
     KeySchedule key_schedule;
     key_expansion(key, matrix_sol_table, key_schedule);
 
-    // 7. 生成明文 & 加密过程 & 筛选 pairs
-    StatePair* filtered_pairs = malloc(MAX_FILTERED_PAIRS * sizeof(StatePair));
-    size_t filtered_count = 0;
+    // 7. 生成明文对结构
+    StatePair* pairs = (StatePair*)check_malloc(MAX_PAIRS * sizeof(StatePair));
+    generate_structure(pairs, MAX_PAIRS, diff_word_temp[0], diff_sol[0]);
+    printf("构造明文对数：%d\n", MAX_PAIRS);
+
+    // 8. 加密过程 & 筛选 pairs
+    StatePair* pairs_cand = (StatePair*)check_malloc(MAX_PAIRS * sizeof(StatePair));
+    StatePair* pairs_cand1 = (StatePair*)check_malloc(MAX_PAIRS * sizeof(StatePair));
+    int pairs_cand_count = 0;
 
     clock_t start = clock();
-    generate_encrypt_and_filter_stream(
-        MAX_PAIRS, diff_word, diff_sol[0], key_schedule,
-        aes_table, matrix_sol_table, diff_output,
-        filtered_pairs, &filtered_count, MAX_FILTERED_PAIRS
-    );
-    printf("最终通过筛选的明密文对数：%zu\n", filtered_count);
+	encrypt_and_filter(pairs, MAX_PAIRS, key_schedule, aes_table, diff_output, pairs_cand1, pairs_cand, &pairs_cand_count, matrix_sol_table);
     clock_t end = clock();
     double duration = ((double)(end - start)) / CLOCKS_PER_SEC * 1000.0;
     printf("循环耗时: %.2f 毫秒\n", duration);
+    printf("满足输出差分的密文对数: %d\n", pairs_cand_count);
 
-    // 8. 猜测密钥
+    // 9. 猜测密钥
     int index_diff_word[2];
     int index_diff_word_count = 0;
     for (int i = 0; i < 16; ++i) {
@@ -534,29 +554,29 @@ int main() {
     int max_index[1 << 16];
     int max_index_count = 0;
 
-	guess_subkeys(matrix_sol_table, filtered_pairs, filtered_count, diff_output, index_diff_word, &max_val, &max_index_count, max_index);
+	guess_subkeys(matrix_sol_table, pairs_cand, pairs_cand_count, diff_output, index_diff_word, &max_val, &max_index_count, max_index);
 
     //uint8_t right_key1 = key_schedule[round + 1][index_inv[index_diff_word[0]]];
     //uint8_t right_key2 = key_schedule[round + 1][index_inv[index_diff_word[1]]];
     //printf("Right key1: 0x%02X, Right key2: 0x%02X\n", right_key1, right_key2); // 大写十六进制输出：0xAB
-    /*for (int i = 0; i < round + 2; ++i) {
+    for (int i = 0; i < round + 2; ++i) {
         for (int j = 0; j < 16; ++j) {
             printf("0x%02X, ", key_schedule[i][j]);
         }
         printf("\n");
     }
-    printf("\n");*/
+    printf("\n");
 
-    // 10. 导出全部候选子密钥
-    FILE* fp = fopen("cand_key_0.txt", "w");   // 打开文件，"w" 表示写入模式
+    //// 10. 导出全部候选子密钥
+    //FILE* fp = fopen("cand_key_0.txt", "w");   // 打开文件，"w" 表示写入模式
 
-    // 将数组元素逐个写入文件
-    for (int i = 0; i < max_index_count; i++) {
-        fprintf(fp, "%d\n", max_index[i]);  // 每个元素占一行
-    }
+    //// 将数组元素逐个写入文件
+    //for (int i = 0; i < max_index_count; i++) {
+    //    fprintf(fp, "%d\n", max_index[i]);  // 每个元素占一行
+    //}
 
-    fclose(fp);  // 关闭文件
-    printf("数组已成功写入到 cand_key_0.txt\n");
+    //fclose(fp);  // 关闭文件
+    //printf("数组已成功写入到 cand_key_0.txt\n");
 
     // 11. 释放内存
     for (int i = 0; i < rows1; i++) free(diff_sol[i]);
@@ -565,7 +585,8 @@ int main() {
     free(diff_sol);
     free(matrix_sol);
     free(diff_word_temp);
-    free(filtered_pairs);
+    free(pairs);
+    free(pairs_cand);
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
             free(aes_table[i][j]);
