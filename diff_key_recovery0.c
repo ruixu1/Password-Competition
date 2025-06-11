@@ -37,8 +37,7 @@ void shift_rows(State state);
 void build_table_aes(uint8_t* sbox_table, uint8_t* time_table, uint8_t**** aes_table);
 void generate_rcon(uint8_t* rcon);
 void key_expansion(const uint8_t* key, uint8_t* table, KeySchedule round_keys);
-void generate_pair(StatePair pair, const int* diff_word,
-    const int* diff_bits);
+void generate_pair(StatePair* pair, const int* diff_word, const int* diff_bits, uint32_t* seed);
 void encrypt(State plaintext, State ciphertext, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table);
 bool pass_filter(State c1, State c2, const uint8_t diff_output[16]);
 void generate_encrypt_and_filter_stream(size_t num_pairs, const int* diff_word, const int* diff_bits, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table, const uint8_t diff_output[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count);
@@ -285,12 +284,21 @@ void key_expansion(const uint8_t* key, uint8_t* table, KeySchedule round_keys) {
     }
 }
 
-// 生成随机明文结构
-void generate_pair(StatePair pair, const int* diff_word,
-    const int* diff_bits) {
-    for (int j = 0; j < STATE_SIZE; j++) {
-        uint8_t v = rand() & 0xFF;
+// 添加在函数声明之后，main函数之前
+static inline uint32_t fast_rand(uint32_t* state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
 
+// 生成随机明文结构
+void generate_pair(StatePair* pair, const int* diff_word, const int* diff_bits, uint32_t* seed) {  // 添加seed参数
+    for (int j = 0; j < STATE_SIZE; j++) {
+        uint8_t v = fast_rand(seed) & 0xFF;  // 使用fast_rand替换rand
+		// 使用fast_rand生成随机数，确保每次调用都能得到不同的随机数
         if (diff_word[j] == 1) {
             uint8_t delta = 0;
             for (int bit = 0; bit < 8; bit++) {
@@ -298,11 +306,11 @@ void generate_pair(StatePair pair, const int* diff_word,
                     delta |= (1 << bit);
                 }
             }
-            pair.first[j] = v;
-            pair.second[j] = v ^ delta;
+            pair->first[j] = v;
+            pair->second[j] = v ^ delta;
         }
         else {
-            pair.first[j] = pair.second[j] = v;
+            pair->first[j] = pair->second[j] = v;
         }
     }
 }
@@ -353,51 +361,77 @@ bool pass_filter(State c1, State c2, const uint8_t diff_output[16]) {
 }
 
 // 单独将加密过程和筛选密文过程分离出来
-void generate_encrypt_and_filter_stream(size_t num_pairs, const int* diff_word, const int* diff_bits, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table, const uint8_t diff_output[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count) {
+void generate_encrypt_and_filter_stream(size_t total_pairs, const int* diff_word, const int* diff_bits, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table, const uint8_t diff_output[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count) {
+    // 限制线程数为物理核心数
     int max_threads = omp_get_max_threads();
-    // 每个线程用私有buffer, 以免冲突
+    if (max_threads > 32) max_threads = 32;  // 调整为你的服务器物理核心数
+
+    // 使用更大的线程本地buffer
+    size_t thread_bufsize = (max_filtered_count / max_threads) + 1000;
     StatePair** thread_buffers = malloc(max_threads * sizeof(StatePair*));
     size_t* thread_counts = calloc(max_threads, sizeof(size_t));
-    size_t thread_bufsize = max_filtered_count / max_threads + 10000;
+
     for (int t = 0; t < max_threads; ++t) {
         thread_buffers[t] = malloc(thread_bufsize * sizeof(StatePair));
     }
 
-    #pragma omp parallel
+    const size_t BATCH_SIZE = 1024;  // 批处理大小
+
+    #pragma omp parallel num_threads(max_threads)
     {
         int tid = omp_get_thread_num();
         StatePair* local_buf = thread_buffers[tid];
         size_t local_count = 0;
 
-        // 每个线程使用自己独立的随机数种子，确保不同线程生成的明文对不同
-        unsigned int seed = (unsigned int)(time(NULL) ^ (tid * 7919));
-        #pragma omp for schedule(static)
-        for (uint64_t i = 0; i < num_pairs; ++i) {
-            StatePair pair;
-            generate_pair(pair, diff_word, diff_bits);
+        // 线程独立的随机数种子
+        uint32_t seed = (uint32_t)(time(NULL) ^ (tid * 7919));
 
-            State c1, c2;
-            encrypt(pair.first, c1, key_schedule, aes_table, matrix_sol_table);
-            encrypt(pair.second, c2, key_schedule, aes_table, matrix_sol_table);
+        // 批处理临时数组
+        StatePair batch[BATCH_SIZE];
+        State c1[BATCH_SIZE], c2[BATCH_SIZE];
 
-            if (pass_filter(c1, c2, diff_output)) {
-                // 保存明密文对
-                for (int k = 0; k < STATE_SIZE; ++k) {
-                    local_buf[local_count].first[k] = pair.first[k];
-                    local_buf[local_count].second[k] = pair.second[k];
+        #pragma omp for schedule(dynamic, 1024)
+        for (size_t i = 0; i < total_pairs; i += BATCH_SIZE) {
+            size_t batch_end = i + BATCH_SIZE;
+            if (batch_end > total_pairs) batch_end = total_pairs;
+
+            // 1. 批量生成明文对
+            for (size_t j = 0; j < batch_end - i; ++j) {
+                generate_pair(&batch[j], diff_word, diff_bits, &seed);
+            }
+
+            // 2. 批量加密
+            for (size_t j = 0; j < batch_end - i; ++j) {
+                encrypt(batch[j].first, c1[j], key_schedule, aes_table, matrix_sol_table);
+                encrypt(batch[j].second, c2[j], key_schedule, aes_table, matrix_sol_table);
+            }
+
+            // 3. 批量过滤
+            for (size_t j = 0; j < batch_end - i; ++j) {
+                if (pass_filter(c1[j], c2[j], diff_output)) {
+                    if (local_count < thread_bufsize) {
+                        memcpy(local_buf[local_count].first, c1[j], STATE_SIZE);
+                        memcpy(local_buf[local_count].second, c2[j], STATE_SIZE);
+                        local_count++;
+                    }
                 }
-                local_count++;
-                // 如果local_count超了thread_bufsize，可以扩容，实际通常不会超
             }
         }
         thread_counts[tid] = local_count;
     }
 
-    // 合并所有线程buffer到全局
+    // 合并结果
     *filtered_count = 0;
     for (int t = 0; t < max_threads; ++t) {
-        for (size_t i = 0; i < thread_counts[t]; ++i) {
-            filtered_pairs[(*filtered_count)++] = thread_buffers[t][i];
+        size_t copy_count = thread_counts[t];
+        if (*filtered_count + copy_count > max_filtered_count) {
+            copy_count = max_filtered_count - *filtered_count;
+        }
+        if (copy_count > 0) {
+            memcpy(&filtered_pairs[*filtered_count],
+                thread_buffers[t],
+                copy_count * sizeof(StatePair));
+            *filtered_count += copy_count;
         }
         free(thread_buffers[t]);
     }
