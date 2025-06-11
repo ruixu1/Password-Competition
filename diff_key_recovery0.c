@@ -5,7 +5,8 @@
 #include <time.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <omp.h>
+//#include <omp.h>
+#include <mpi.h>
 
 // Constants
 #define STATE_SIZE 16   // 128位
@@ -25,10 +26,30 @@ typedef struct {
     State second;
 } StatePair;
 
+typedef struct {
+    uint32_t state;
+    int rank;
+} RandomState;
+
+// 错误处理宏
+#define MPI_CHECK(call) \
+    do { \
+        int err = call; \
+        if (err != MPI_SUCCESS) { \
+            char error_string[MPI_MAX_ERROR_STRING]; \
+            int length; \
+            MPI_Error_string(err, error_string, &length); \
+            fprintf(stderr, "MPI error at %s:%d: %s\n", __FILE__, __LINE__, error_string); \
+            MPI_Abort(MPI_COMM_WORLD, err); \
+        } \
+    } while (0)
+
 // Function declarations
 // 函数原型声明部分
 void* check_malloc(size_t size);
 int** read_data_int(const char* filename, int base, int* rows, int* cols);
+void init_random_state(RandomState* rs, int rank);
+uint32_t next_random(RandomState* rs);
 void compute_diff_output(int* diff_word, int** diff_sol, int** matrix_sol, const int index[], uint8_t diff_output[16]);
 void print_state(State diff);
 void build_lookup_tables(int** matrix_sol, uint8_t matrix_sol_table[256], uint8_t xtime_table[256]);
@@ -37,11 +58,12 @@ void shift_rows(State state);
 void build_table_aes(uint8_t* sbox_table, uint8_t* time_table, uint8_t**** aes_table);
 void generate_rcon(uint8_t* rcon);
 void key_expansion(const uint8_t* key, uint8_t* table, KeySchedule round_keys);
-void generate_pair(StatePair* pair, const int* diff_word, const int* diff_bits, uint32_t* seed);
+void generate_pair(StatePair* pair, const int* diff_word, const int* diff_bits, RandomState* rs);
 void encrypt(State plaintext, State ciphertext, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table);
 bool pass_filter(State c1, State c2, const uint8_t diff_output[16]);
-void generate_encrypt_and_filter_stream(size_t num_pairs, const int* diff_word, const int* diff_bits, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table, const uint8_t diff_output[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count);
+void generate_encrypt_and_filter_stream(size_t total_pairs, const int* diff_word, const int* diff_bits, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table, const uint8_t diff_output[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count, RandomState* rs);
 void guess_subkeys(const uint8_t matrix_sol_table[256], const StatePair* pairs_cand, int pairs_cand_count, const uint8_t diff_output[16], const int index_diff_word[2], int* max_val, int* max_index_count, int* max_index);
+void broadcast_matrix(int** matrix, int rows, int cols, int root, MPI_Comm comm);
 
 
 // Function declarations
@@ -101,6 +123,43 @@ int** read_data_int(const char* filename, int base, int* rows, int* cols) {
 
     fclose(file);
     return matrix;
+}
+
+// 广播矩阵数据到所有进程
+void broadcast_matrix(int** matrix, int rows, int cols, int root, MPI_Comm comm) {
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+
+    // 广播矩阵维度
+    int dims[2] = { rows, cols };
+    MPI_CHECK(MPI_Bcast(dims, 2, MPI_INT, root, comm));
+
+    // 非root进程分配内存
+    if (rank != root) {
+        matrix = (int**)check_malloc(dims[0] * sizeof(int*));
+        for (int i = 0; i < dims[0]; i++) {
+            matrix[i] = (int*)check_malloc(dims[1] * sizeof(int));
+        }
+    }
+
+    // 广播数据
+    for (int i = 0; i < dims[0]; i++) {
+        MPI_CHECK(MPI_Bcast(matrix[i], dims[1], MPI_INT, root, comm));
+    }
+}
+
+void init_random_state(RandomState* rs, int rank) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    // 使用纳秒级时间戳提高初始随机性
+    rs->state = (uint32_t)(ts.tv_nsec + rank * 1299709);
+    rs->rank = rank;
+}
+
+uint32_t next_random(RandomState* rs) {
+    // 使用线性同余法生成随机数
+    rs->state = rs->state * 1103515245 + 12345;
+    return rs->state;
 }
 
 // 拆出 diff_output 计算函数
@@ -295,10 +354,10 @@ static inline uint32_t fast_rand(uint32_t* state) {
 }
 
 // 生成随机明文结构
-void generate_pair(StatePair* pair, const int* diff_word, const int* diff_bits, uint32_t* seed) {  // 添加seed参数
+void generate_pair(StatePair* pair, const int* diff_word, const int* diff_bits, RandomState* rs) {
     for (int j = 0; j < STATE_SIZE; j++) {
-        uint8_t v = fast_rand(seed) & 0xFF;  // 使用fast_rand替换rand
-		// 使用fast_rand生成随机数，确保每次调用都能得到不同的随机数
+        // 使用next_random生成随机数，确保每次调用都能得到不同的随机数
+        uint8_t v = next_random(rs) & 0xFF;  // 使用新的随机数生成器
         if (diff_word[j] == 1) {
             uint8_t delta = 0;
             for (int bit = 0; bit < 8; bit++) {
@@ -361,82 +420,91 @@ bool pass_filter(State c1, State c2, const uint8_t diff_output[16]) {
 }
 
 // 单独将加密过程和筛选密文过程分离出来
-void generate_encrypt_and_filter_stream(size_t total_pairs, const int* diff_word, const int* diff_bits, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table, const uint8_t diff_output[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count) {
-    // 限制线程数为物理核心数
-    int max_threads = omp_get_max_threads();
-    if (max_threads > 32) max_threads = 32;  // 调整为你的服务器物理核心数
+void generate_encrypt_and_filter_stream(size_t total_pairs, const int* diff_word, const int* diff_bits, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table, const uint8_t diff_output[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count, RandomState* rs)
+{
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // 使用更大的线程本地buffer
-    size_t thread_bufsize = (max_filtered_count / max_threads) + 1000;
-    StatePair** thread_buffers = malloc(max_threads * sizeof(StatePair*));
-    size_t* thread_counts = calloc(max_threads, sizeof(size_t));
+    // 计算每个进程的工作量
+    size_t pairs_per_proc = total_pairs / size;
+    size_t start_pair = rank * pairs_per_proc;
+    size_t end_pair = (rank == size - 1) ? total_pairs : (rank + 1) * pairs_per_proc;
 
-    for (int t = 0; t < max_threads; ++t) {
-        thread_buffers[t] = malloc(thread_bufsize * sizeof(StatePair));
-    }
+    // 本地缓冲区 - 使用check_malloc替代malloc
+    const size_t BATCH_SIZE = 1024;
+    StatePair* local_buf = check_malloc(max_filtered_count * sizeof(StatePair));
+    size_t local_count = 0;
 
-    const size_t BATCH_SIZE = 1024;  // 批处理大小
+    //// 进程特定的随机数种子
+    //uint32_t seed = (uint32_t)(time(NULL) ^ (rank * 7919));
 
-    #pragma omp parallel num_threads(max_threads)
-    {
-        int tid = omp_get_thread_num();
-        StatePair* local_buf = thread_buffers[tid];
-        size_t local_count = 0;
+    // 临时数组
+    StatePair batch[BATCH_SIZE];
+    State c1[BATCH_SIZE], c2[BATCH_SIZE];
 
-        // 线程独立的随机数种子
-        uint32_t seed = (uint32_t)(time(NULL) ^ (tid * 7919));
+    // 主处理循环
+    for (size_t i = start_pair; i < end_pair; i += BATCH_SIZE) {
+        size_t batch_end = i + BATCH_SIZE;
+        if (batch_end > end_pair) batch_end = end_pair;
+        size_t batch_size = batch_end - i;
 
-        // 批处理临时数组
-        StatePair batch[BATCH_SIZE];
-        State c1[BATCH_SIZE], c2[BATCH_SIZE];
+        // 批量处理
+        for (size_t j = 0; j < batch_size; ++j) {
+            //generate_pair(&batch[j], diff_word, diff_bits, &seed);
+            // 使用新的随机数生成器
+            generate_pair(&batch[j], diff_word, diff_bits, rs);  // 修改这行
 
-        #pragma omp for schedule(dynamic, 1024)
-        for (size_t i = 0; i < total_pairs; i += BATCH_SIZE) {
-            size_t batch_end = i + BATCH_SIZE;
-            if (batch_end > total_pairs) batch_end = total_pairs;
+            encrypt(batch[j].first, c1[j], key_schedule, aes_table, matrix_sol_table);
+            encrypt(batch[j].second, c2[j], key_schedule, aes_table, matrix_sol_table);
 
-            // 1. 批量生成明文对
-            for (size_t j = 0; j < batch_end - i; ++j) {
-                generate_pair(&batch[j], diff_word, diff_bits, &seed);
-            }
-
-            // 2. 批量加密
-            for (size_t j = 0; j < batch_end - i; ++j) {
-                encrypt(batch[j].first, c1[j], key_schedule, aes_table, matrix_sol_table);
-                encrypt(batch[j].second, c2[j], key_schedule, aes_table, matrix_sol_table);
-            }
-
-            // 3. 批量过滤
-            for (size_t j = 0; j < batch_end - i; ++j) {
-                if (pass_filter(c1[j], c2[j], diff_output)) {
-                    if (local_count < thread_bufsize) {
-                        memcpy(local_buf[local_count].first, c1[j], STATE_SIZE);
-                        memcpy(local_buf[local_count].second, c2[j], STATE_SIZE);
-                        local_count++;
-                    }
+            if (pass_filter(c1[j], c2[j], diff_output)) {
+                if (local_count < max_filtered_count) {
+                    memcpy(local_buf[local_count].first, c1[j], STATE_SIZE);
+                    memcpy(local_buf[local_count].second, c2[j], STATE_SIZE);
+                    local_count++;
                 }
             }
         }
-        thread_counts[tid] = local_count;
     }
 
-    // 合并结果
-    *filtered_count = 0;
-    for (int t = 0; t < max_threads; ++t) {
-        size_t copy_count = thread_counts[t];
-        if (*filtered_count + copy_count > max_filtered_count) {
-            copy_count = max_filtered_count - *filtered_count;
-        }
-        if (copy_count > 0) {
-            memcpy(&filtered_pairs[*filtered_count],
-                thread_buffers[t],
-                copy_count * sizeof(StatePair));
-            *filtered_count += copy_count;
-        }
-        free(thread_buffers[t]);
+    // 创建MPI数据类型用于StatePair
+    MPI_Datatype mpi_statepair;
+    MPI_Type_contiguous(sizeof(StatePair), MPI_BYTE, &mpi_statepair);
+    MPI_Type_commit(&mpi_statepair);
+
+    // 收集所有进程的结果数量
+    size_t* all_counts = NULL;
+    size_t* displs = NULL;
+    if (rank == 0) {
+        all_counts = check_malloc(size * sizeof(size_t));  // 使用check_malloc
+        displs = check_malloc(size * sizeof(size_t));      // 使用check_malloc
     }
-    free(thread_buffers);
-    free(thread_counts);
+
+    // 收集每个进程的局部结果数量
+    MPI_Gather(&local_count, 1, MPI_UNSIGNED_LONG_LONG, all_counts, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+
+    // 计算位移和总数
+    if (rank == 0) {
+        displs[0] = 0;
+        size_t total = all_counts[0];
+        for (int i = 1; i < size; i++) {
+            displs[i] = displs[i - 1] + all_counts[i - 1];
+            total += all_counts[i];
+        }
+        *filtered_count = (total > max_filtered_count) ? max_filtered_count : total;
+    }
+
+    // 收集所有结果
+    MPI_Gatherv(local_buf, local_count, mpi_statepair, filtered_pairs, all_counts, displs, mpi_statepair, 0, MPI_COMM_WORLD);
+
+    // 清理
+    MPI_Type_free(&mpi_statepair);
+    free(local_buf);
+    if (rank == 0) {
+        free(all_counts);
+        free(displs);
+    }
 }
 
 // 单独将猜测子密钥过程分离出来
@@ -508,105 +576,202 @@ void guess_subkeys(const uint8_t matrix_sol_table[256], const StatePair* pairs_c
     }
 }
 
-int main() {
-    // 1. 读取必要的数据
-    int rows1, cols1, rows2, cols2, rows3, cols3;
-    int** diff_sol = read_data_int("diff_sol_0.txt", 10, &rows1, &cols1);
-    int** matrix_sol = read_data_int("matrix_sol.txt", 10, &rows2, &cols2);
-    int** diff_word_temp = read_data_int("diff_word_0.txt", 10, &rows3, &cols3);
-    printf("不等式读取完毕\n");
+int main(int argc, char** argv) {
+    int rank, size;
+    double start_time, end_time;
 
-    // 2. 初始化变量和数据结构
-    srand((unsigned int)time(NULL));
-    int* diff_word = diff_word_temp[0];
+    // 1. 初始化MPI
+    MPI_CHECK(MPI_Init(&argc, &argv));
+    MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
+    MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &size));
+
+    // 记录开始时间
+    start_time = MPI_Wtime();
+
+    // 初始化随机数生成器
+    RandomState rs;
+    init_random_state(&rs, rank);
+
+    if (rank == 0) {
+        printf("Running with %d processes\n", size);
+        printf("Program initialization completed, starting main computation...\n\n");
+    }
+
+    // 这些变量所有进程都需要，所以在外面声明
+    // 2. 声明所需变量
+    int rows1, cols1, rows2, cols2, rows3, cols3;
+    int** diff_sol = NULL, ** matrix_sol = NULL, ** diff_word_temp = NULL;
+    int* diff_word = NULL;
+    State diff_output;
+    uint8_t matrix_sol_table[256] = { 0 };
+    uint8_t xtime_table[256] = { 0 };
+    uint8_t*** aes_table = NULL;
+    KeySchedule key_schedule;
+    uint8_t key[] = { 0x3F, 0xA9, 0x72, 0x5C, 0x01, 0xBD, 0xE2, 0x9F, 0x56, 0x11, 0x3A, 0xC4, 0xD8, 0x77, 0x99, 0xAB };
     int index[] = { 0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11 };
     int index_inv[] = { 0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3 };
 
-    // 3. 计算 diff_output
-    State diff_output;
-    compute_diff_output(diff_word, diff_sol, matrix_sol, index, diff_output);
-    print_state(diff_output);
+    // 3. 主进程读取数据并进行初始计算
+    if (rank == 0) {
+        // 读取数据
+        diff_sol = read_data_int("diff_sol_0.txt", 10, &rows1, &cols1);
+        matrix_sol = read_data_int("matrix_sol.txt", 10, &rows2, &cols2);
+        diff_word_temp = read_data_int("diff_word_0.txt", 10, &rows3, &cols3);
+        diff_word = diff_word_temp[0];
 
-    // 4. 构建查找表
-    uint8_t matrix_sol_table[256] = { 0 };
-    uint8_t xtime_table[256] = { 0 };
-    build_lookup_tables(matrix_sol, matrix_sol_table, xtime_table);
+        printf("Data reading completed.\n");
 
-    // 5. 构建AES表
-    uint8_t*** aes_table = NULL;
-    build_table_aes(matrix_sol_table, xtime_table, &aes_table);
+        // 初始计算
+        compute_diff_output(diff_word, diff_sol, matrix_sol, index, diff_output);
+        printf("Differential output computed:\n");
+        print_state(diff_output);
 
-    // 6. 生成主密钥以及密钥拓展
-    uint8_t key[] = { 0x3F, 0xA9, 0x72, 0x5C, 0x01, 0xBD, 0xE2, 0x9F, 0x56, 0x11, 0x3A, 0xC4, 0xD8, 0x77, 0x99, 0xAB };
-    KeySchedule key_schedule;
-    key_expansion(key, matrix_sol_table, key_schedule);
+        // 构建查找表
+        build_lookup_tables(matrix_sol, matrix_sol_table, xtime_table);
+        printf("Lookup tables built.\n");
 
-    // 7. 生成明文 & 加密过程 & 筛选 pairs
-    StatePair* filtered_pairs = malloc(MAX_FILTERED_PAIRS * sizeof(StatePair));
-    size_t filtered_count = 0;
+        // 构建AES表
+        build_table_aes(matrix_sol_table, xtime_table, &aes_table);
+        printf("AES tables built.\n");
 
-    clock_t start = clock();
-    generate_encrypt_and_filter_stream(
-        MAX_PAIRS, diff_word, diff_sol[0], key_schedule,
-        aes_table, matrix_sol_table, diff_output,
-        filtered_pairs, &filtered_count, MAX_FILTERED_PAIRS
-    );
-    printf("最终通过筛选的明密文对数：%zu\n", filtered_count);
-    clock_t end = clock();
-    double duration = ((double)(end - start)) / CLOCKS_PER_SEC * 1000.0;
-    printf("循环耗时: %.2f 毫秒\n", duration);
+        // 密钥扩展
+        key_expansion(key, matrix_sol_table, key_schedule);
+        printf("Key schedule completed.\n");
 
-    // 8. 猜测密钥
-    int index_diff_word[2];
-    int index_diff_word_count = 0;
-    for (int i = 0; i < 16; ++i) {
-        if (diff_word[i]) {
-            index_diff_word[index_diff_word_count++] = i;
+        // 测试随机数生成器
+        printf("Testing random number generator:\n");
+        for (int i = 0; i < 5; i++) {
+            printf("Random %d: %u\n", i, next_random(&rs));
         }
     }
-    int max_val = 0;
-    int max_index[1 << 16];
-    int max_index_count = 0;
 
-	guess_subkeys(matrix_sol_table, filtered_pairs, filtered_count, diff_output, index_diff_word, &max_val, &max_index_count, max_index);
+    // 4. 广播必要数据给所有进程
+    // 广播维度信息
+    MPI_CHECK(MPI_Bcast(&rows1, 1, MPI_INT, 0, MPI_COMM_WORLD));
+    MPI_CHECK(MPI_Bcast(&cols1, 1, MPI_INT, 0, MPI_COMM_WORLD));
+    MPI_CHECK(MPI_Bcast(&rows2, 1, MPI_INT, 0, MPI_COMM_WORLD));
+    MPI_CHECK(MPI_Bcast(&cols2, 1, MPI_INT, 0, MPI_COMM_WORLD));
+    MPI_CHECK(MPI_Bcast(&rows3, 1, MPI_INT, 0, MPI_COMM_WORLD));
+    MPI_CHECK(MPI_Bcast(&cols3, 1, MPI_INT, 0, MPI_COMM_WORLD));
 
-    //uint8_t right_key1 = key_schedule[round + 1][index_inv[index_diff_word[0]]];
-    //uint8_t right_key2 = key_schedule[round + 1][index_inv[index_diff_word[1]]];
-    //printf("Right key1: 0x%02X, Right key2: 0x%02X\n", right_key1, right_key2); // 大写十六进制输出：0xAB
-    /*for (int i = 0; i < round + 2; ++i) {
-        for (int j = 0; j < 16; ++j) {
-            printf("0x%02X, ", key_schedule[i][j]);
+    // 广播矩阵数据
+    broadcast_matrix(diff_sol, rows1, cols1, 0, MPI_COMM_WORLD);
+    broadcast_matrix(matrix_sol, rows2, cols2, 0, MPI_COMM_WORLD);
+    broadcast_matrix(diff_word_temp, rows3, cols3, 0, MPI_COMM_WORLD);
+
+    // 广播计算结果
+    MPI_CHECK(MPI_Bcast(diff_output, STATE_SIZE, MPI_UINT8_T, 0, MPI_COMM_WORLD));
+    MPI_CHECK(MPI_Bcast(matrix_sol_table, 256, MPI_UINT8_T, 0, MPI_COMM_WORLD));
+    MPI_CHECK(MPI_Bcast(xtime_table, 256, MPI_UINT8_T, 0, MPI_COMM_WORLD));
+
+    // 广播AES表（需要特殊处理三维数组）
+    if (rank != 0) {
+        aes_table = (uint8_t***)check_malloc(4 * sizeof(uint8_t**));
+        for (int i = 0; i < 4; i++) {
+            aes_table[i] = (uint8_t**)check_malloc(4 * sizeof(uint8_t*));
+            for (int j = 0; j < 4; j++) {
+                aes_table[i][j] = (uint8_t*)check_malloc(256 * sizeof(uint8_t));
+            }
         }
-        printf("\n");
-    }
-    printf("\n");*/
-
-    // 10. 导出全部候选子密钥
-    FILE* fp = fopen("cand_key_0.txt", "w");   // 打开文件，"w" 表示写入模式
-
-    // 将数组元素逐个写入文件
-    for (int i = 0; i < max_index_count; i++) {
-        fprintf(fp, "%d\n", max_index[i]);  // 每个元素占一行
     }
 
-    fclose(fp);  // 关闭文件
-    printf("数组已成功写入到 cand_key_0.txt\n");
-
-    // 11. 释放内存
-    for (int i = 0; i < rows1; i++) free(diff_sol[i]);
-    for (int i = 0; i < rows2; i++) free(matrix_sol[i]);
-    for (int i = 0; i < rows3; i++) free(diff_word_temp[i]);
-    free(diff_sol);
-    free(matrix_sol);
-    free(diff_word_temp);
-    free(filtered_pairs);
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
-            free(aes_table[i][j]);
+            MPI_CHECK(MPI_Bcast(aes_table[i][j], 256, MPI_UINT8_T, 0, MPI_COMM_WORLD));
         }
-        free(aes_table[i]);
     }
-    free(aes_table);
 
+    // 广播密钥扩展结果
+    MPI_CHECK(MPI_Bcast(key_schedule, sizeof(KeySchedule), MPI_BYTE, 0, MPI_COMM_WORLD));
+
+    if (rank == 0) {
+        printf("All data broadcast completed. Proceeding to main computation...\n");
+    }
+
+    // 5. 同步所有进程
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // 6. 生成明文 & 加密过程 & 筛选 pairs
+    StatePair* filtered_pairs = NULL;
+    size_t filtered_count = 0;
+    if (rank == 0) {
+        filtered_pairs = malloc(MAX_FILTERED_PAIRS * sizeof(StatePair));
+    }
+
+    // 在generate_encrypt_and_filter_stream函数中使用随机数生成器
+    // 需要修改函数签名以接收RandomState参数, 添加随机数生成器参数&rs
+    generate_encrypt_and_filter_stream(MAX_PAIRS, diff_word, diff_sol[0], key_schedule, aes_table, matrix_sol_table, diff_output, filtered_pairs, &filtered_count, MAX_FILTERED_PAIRS, &rs);
+
+    // 7. 只在主进程处理结果和写文件
+    if (rank == 0) {
+        printf("最终通过筛选的明密文对数：%zu\n", filtered_count);
+        /*clock_t end = clock();
+        double duration = ((double)(end - start)) / CLOCKS_PER_SEC * 1000.0;
+        printf("循环耗时: %.2f 毫秒\n", duration);*/
+        // ... 结果处理和文件写入 ...
+
+        // 猜测密钥
+        int index_diff_word[2];
+        int index_diff_word_count = 0;
+        for (int i = 0; i < 16; ++i) {
+            if (diff_word[i]) {
+                index_diff_word[index_diff_word_count++] = i;
+            }
+        }
+        int max_val = 0;
+        int* max_index = check_malloc((1 << 16) * sizeof(int));  // 使用check_malloc
+        int max_index_count = 0;
+
+        guess_subkeys(matrix_sol_table, filtered_pairs, filtered_count, diff_output, index_diff_word, &max_val, &max_index_count, max_index);
+
+        // 导出全部候选子密钥
+        FILE* fp = fopen("cand_key_0.txt", "w");   // 打开文件，"w" 表示写入模式
+
+        // 将数组元素逐个写入文件
+        for (int i = 0; i < max_index_count; i++) {
+            fprintf(fp, "%d\n", max_index[i]);  // 每个元素占一行
+        }
+
+        fclose(fp);  // 关闭文件
+        printf("数组已成功写入到 cand_key_0.txt\n");
+
+        free(max_index);  // 确实需要这行代码来释放内存
+
+        end_time = MPI_Wtime();
+        printf("总运行时间: %.2f 秒\n", end_time - start_time);
+    }
+    
+    // 8. 清理内存
+    if (rank == 0) {
+        // 释放内存
+        for (int i = 0; i < rows1; i++) free(diff_sol[i]);
+        for (int i = 0; i < rows2; i++) free(matrix_sol[i]);
+        for (int i = 0; i < rows3; i++) free(diff_word_temp[i]);
+        free(diff_sol);
+        free(matrix_sol);
+        free(diff_word_temp);
+        free(filtered_pairs);
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                free(aes_table[i][j]);
+            }
+            free(aes_table[i]);
+        }
+        free(aes_table);
+    }
+    else {
+        // 非主进程也需要释放aes_table
+        if (aes_table != NULL) {
+            for (int i = 0; i < 4; i++) {
+                for (int j = 0; j < 4; j++) {
+                    free(aes_table[i][j]);
+                }
+                free(aes_table[i]);
+            }
+            free(aes_table);
+        }
+    }
+
+    MPI_CHECK(MPI_Finalize());
     return 0;
 }
