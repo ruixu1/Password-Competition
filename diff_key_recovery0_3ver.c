@@ -45,7 +45,7 @@ static uint64_t splitmix64(uint64_t* x);
 void xoshiro256plusplus_init(xoshiro256plusplus_state* state, uint64_t seed, uint64_t thread_id);
 static inline uint64_t rotl(const uint64_t x, int k);
 uint64_t xoshiro256plusplus_next(xoshiro256plusplus_state* state);
-void generate_pair(StatePair* pair, const uint8_t diff_bites[16], RC4State* rs);
+void generate_pair(StatePair* pair, const uint8_t diff_bites[16], xoshiro256plusplus_state* prng);
 void encrypt(const uint8_t plaintext[16], State ciphertext, const KeySchedule key_schedule, const uint8_t aes_table[16][256], const uint8_t matrix_sbox_table[256], const int index[16]);
 bool pass_filter(const uint8_t c1[16], const uint8_t c2[16], const uint8_t diff_output[16]);
 void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_bites[16], const KeySchedule key_schedule, const uint8_t aes_table[16][256], const uint8_t matrix_sbox_table[256], const uint8_t diff_output[16], const int index[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count, uint64_t global_seed);
@@ -78,7 +78,7 @@ void build_lookup_tables(const uint8_t matrix_sol[8], uint8_t matrix_sol_table[2
         else if (i == 1) temp1 = 0;
 		
         for (j = 0; j < 8; j++) {
-            if (__builtin_parity(matrix_sol[j] & i) {
+            if (__builtin_parity(matrix_sol[j] & i)) {
                 temp_value |= (1 << j);
             }
         }
@@ -86,7 +86,7 @@ void build_lookup_tables(const uint8_t matrix_sol[8], uint8_t matrix_sol_table[2
 
         temp_value = 0;
         for (j = 0; j < 8; j++) {
-            if (__builtin_parity(matrix_sol[j] & temp1) {
+            if (__builtin_parity(matrix_sol[j] & temp1)) {
                 temp_value |= (1 << j);
             }
         }
@@ -328,7 +328,7 @@ void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_b
     }
 
     // 推荐大BATCH_SIZE，现代主机16~128k都可以
-    const size_t BATCH_SIZE = 16384; // 可根据内存调优
+    const size_t BATCH_SIZE = 1024; // 可根据内存调优
 
     // 用于每个线程记录其负责的全局pair区间
     size_t pairs_per_thread = (total_pairs + max_threads - 1) / max_threads;
@@ -356,7 +356,7 @@ void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_b
             size_t batch_count = (i + BATCH_SIZE > my_end) ? (my_end - i) : BATCH_SIZE;
 
             // 1. 批量生成明文对
-            for (size_t j = 0; j < batch_count; ++j) {
+            for (j = 0; j < batch_count; ++j) {
                 // 每次用prng生成128位明文
                 uint64_t r1 = xoshiro256plusplus_next(&prng);
                 uint64_t r2 = xoshiro256plusplus_next(&prng);
@@ -369,13 +369,13 @@ void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_b
             }
 
             // 2. 批量加密
-            for (j = 0; j < batch_end - i; ++j) {
+            for (j = 0; j < batch_count; ++j) {
                 encrypt(batch[j].first, c1[j], key_schedule, aes_table, matrix_sbox_table, index);
                 encrypt(batch[j].second, c2[j], key_schedule, aes_table, matrix_sbox_table, index);
             }
 
             // 3. 批量过滤
-            for (j = 0; j < batch_end - i; ++j) {
+            for (j = 0; j < batch_count; ++j) {
                 if (pass_filter(c1[j], c2[j], diff_output)) {
                     if (local_count < thread_bufsize) {
                         memcpy(local_buf[local_count].first, c1[j], STATE_SIZE);
