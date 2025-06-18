@@ -14,10 +14,10 @@
 #define BYTE_SIZE 8
 #define BATCH_SIZE 1024  // 将批处理大小定义为常量
 #define MAX_LINE_LENGTH 1024
-//#define MAX_PAIRS (1ULL<<32)
-#define MAX_PAIRS 200000
+#define MAX_PAIRS (1ULL<<36)
+//#define MAX_PAIRS 10000000
+#define round 140
 #define MAX_FILTERED_PAIRS 10000  // 最多在内存中保留多少对通过筛选的明密文对
-#define round 20
 #define AES_TABLE_ROW(OUT_IDX, T0, T1, T2, T3, IN_IDX_0, IN_IDX_1, IN_IDX_2, IN_IDX_3) \
     ciphertext[OUT_IDX] = aes_table[T0][c_temp[IN_IDX_0]] ^ \
                           aes_table[T1][c_temp[IN_IDX_1]] ^ \
@@ -64,7 +64,7 @@ uint64_t xoshiro256plusplus_next(xoshiro256plusplus_state* state);
 void generate_pair(StatePair* pair, const uint8_t diff_bites[16], xoshiro256plusplus_state* prng);
 void encrypt(const uint8_t plaintext[16], State ciphertext, const KeySchedule key_schedule, const uint8_t aes_table[16][256], const uint8_t matrix_sbox_table[256], const int index[16]);
 bool pass_filter(const uint8_t c1[16], const uint8_t c2[16], const uint8_t diff_output[16]);
-void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_bites[16], const KeySchedule key_schedule, const uint8_t aes_table[16][256], const uint8_t matrix_sbox_table[256], const uint8_t diff_output[16], const int index[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count, uint64_t global_seed);
+void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_bites[16], const KeySchedule key_schedule, const uint8_t aes_table[16][256], const uint8_t matrix_sbox_table[256], const uint8_t diff_output[16], const int index[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count, uint64_t global_seed, int mpi_rank, int mpi_size);
 void guess_subkeys(const uint8_t matrix_sbox_table[256], const StatePair* pairs_cand, int pairs_cand_count, const uint8_t diff_output[16], const int index_diff_word[2], int* max_val, int* max_index_count, int* max_index);
 
 
@@ -359,9 +359,12 @@ void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_b
     size_t my_end = my_start + pairs_per_rank;
     if (my_end > total_pairs) my_end = total_pairs;
 
-    // 2. 本地buffer分配
-    size_t local_max = max_filtered_count; // 可根据实际调节
-    StatePair* local_filtered = malloc(local_max * sizeof(StatePair));
+    // 2. 分配对齐的本地缓冲区
+    StatePair* batch = (StatePair*)aligned_alloc(64, BATCH_SIZE * sizeof(StatePair));
+    State* c1 = (State*)aligned_alloc(64, BATCH_SIZE * sizeof(State));
+    State* c2 = (State*)aligned_alloc(64, BATCH_SIZE * sizeof(State));
+
+    // 用于记录本地筛选结果的计数器
     size_t local_count = 0;
 
     // 3. 初始化PRNG
@@ -394,19 +397,21 @@ void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_b
         // 3. 批量过滤
         for (j = 0; j < batch_count; ++j) {
             if (pass_filter(c1[j], c2[j], diff_output)) {
-                if (local_count < thread_bufsize) {
-                    memcpy(local_buf[local_count].first, c1[j], STATE_SIZE);
-                    memcpy(local_buf[local_count].second, c2[j], STATE_SIZE);
+                if (local_count < max_filtered_count) {  // 使用传入的max_filtered_count
+                    memcpy(filtered_pairs[local_count].first, c1[j], STATE_SIZE);
+                    memcpy(filtered_pairs[local_count].second, c2[j], STATE_SIZE);
                     local_count++;
                 }
             }
         }
     }
 
-    // 5. 返回数据
+    // 5. 返回筛选结果数量
     *filtered_count = local_count;
-    memcpy(filtered_pairs, local_filtered, local_count * sizeof(StatePair));
-    free(local_filtered);
+
+    free(batch);
+    free(c1);
+    free(c2);
 }
 
 // 单独将猜测子密钥过程分离出来
@@ -477,7 +482,7 @@ int main(int argc, char* argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // 2. 初始化变量和数据结构
+    // 1. 初始化变量和数据结构
     int i, j;
     srand((unsigned int)time(NULL));
     int index[] = { 0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11 };
@@ -487,23 +492,21 @@ int main(int argc, char* argv[]) {
     uint8_t matrix_sol[] = { 0x97, 0x92, 0x94, 0x98, 0x10, 0x20, 0x40, 0x80 };
     uint64_t global_seed = 0xC7E6A3B2F19D4E58ULL; // 全局种子，用于xoshiro256plusplus初始化
 
-    // 4. 构建查找表
+    // 2. 构建查找表
     uint8_t matrix_sol_table[256] = { 0 };
     uint8_t matrix_sbox_table[256] = { 0 };
     uint8_t xtime_table[256] = { 0 };
     build_lookup_tables(matrix_sol, matrix_sol_table, matrix_sbox_table, xtime_table);
 
+    uint8_t aes_table[16][256] = { { 0x00 } };
+    build_table_aes(matrix_sbox_table, xtime_table, aes_table);
+
     // 3. 计算 diff_output
     State diff_output;
     compute_diff_output(diff_word, diff_sol, matrix_sol_table, diff_output);
-    print_state(diff_output);
+    print_state(diff_output);    
 
-    // 5. 构建AES表
-    uint8_t aes_table[16][256] = { { 0x00 } };
-
-    build_table_aes(matrix_sbox_table, xtime_table, aes_table);
-
-    // 6. 生成主密钥以及密钥拓展
+    // 4. 生成主密钥以及密钥拓展
     // 生成轮常数rcon
     uint8_t rcon[round + 2];
     generate_rcon(rcon);
@@ -513,47 +516,61 @@ int main(int argc, char* argv[]) {
     key_expansion(key, matrix_sbox_table, rcon, key_schedule);
 
     clock_t start = clock();
-    // ==== 1. 各进程独立生成、加密、筛选 ====
+
+    // 5. 各进程独立生成、加密、筛选
+    // 创建MPI派生类型
+    MPI_Datatype pair_type;
+    MPI_Type_contiguous(32, MPI_BYTE, &pair_type);
+    MPI_Type_commit(&pair_type);
+
     StatePair* local_pairs = malloc(MAX_FILTERED_PAIRS * sizeof(StatePair));
     size_t local_count = 0;
 
-    generate_encrypt_and_filter_stream_mpi(MAX_PAIRS, diff_sol, key_schedule, aes_table, matrix_sbox_table, diff_output, index, local_pairs, &local_count, MAX_FILTERED_PAIRS, global_seed, rank, size);
+    generate_encrypt_and_filter_stream(MAX_PAIRS, diff_sol, key_schedule, aes_table, matrix_sbox_table, diff_output, index, local_pairs, &local_count, MAX_FILTERED_PAIRS, global_seed, rank, size);
 
-    // ==== 2. 汇总所有进程筛选结果 ====
-    // 先收集所有进程local_count
-    size_t* all_counts = NULL;
-    size_t* displs = NULL;
+    // 6. 汇总所有进程筛选结果
+    int* recv_counts = NULL;
+    int* displs = NULL;
+    size_t* temp_counts = NULL;
     if (rank == 0) {
-        all_counts = malloc(size * sizeof(size_t));
-        displs = malloc(size * sizeof(size_t));
+        recv_counts = malloc(size * sizeof(int));
+        displs = malloc(size * sizeof(int));
+        temp_counts = malloc(size * sizeof(size_t));
     }
-    MPI_Gather(&local_count, 1, MPI_UNSIGNED_LONG_LONG, all_counts, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
 
-    // 计算总数与偏移量
-    size_t total_count = 0;
+    // 收集所有进程的计数
+    MPI_Gather(&local_count, 1, MPI_UNSIGNED_LONG_LONG, temp_counts, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+
+    // 计算偏移量并转换类型
     if (rank == 0) {
-        displs[0] = 0;
-        for (int i = 0; i < size; ++i) {
-            if (i > 0) displs[i] = displs[i - 1] + all_counts[i - 1];
-            total_count += all_counts[i];
+        size_t total_count = 0;
+        for (int i = 0; i < size; i++) {
+            recv_counts[i] = (int)temp_counts[i];
+            displs[i] = (i == 0) ? 0 : displs[i - 1] + recv_counts[i - 1];
+            total_count += temp_counts[i];
         }
+        printf("最终通过筛选的明密文对数：%zu\n", total_count);
     }
 
-    // 主进程准备全局buffer
+    // 收集所有密文对
     StatePair* all_pairs = NULL;
-    if (rank == 0) all_pairs = malloc(total_count * sizeof(StatePair));
-
-    // gather所有筛选通过的pair
-    MPI_Gatherv(local_pairs, local_count * sizeof(StatePair), MPI_BYTE, all_pairs, all_counts, displs, MPI_BYTE, 0, MPI_COMM_WORLD);
-
-    printf("最终通过筛选的明密文对数：%zu\n", all_counts);
-    clock_t end = clock();
-    double duration = ((double)(end - start)) / CLOCKS_PER_SEC * 1000.0;
-    printf("循环耗时: %.2f 毫秒\n", duration);
-
-    // 主进程处理最终all_pairs
     if (rank == 0) {
-        // 8. 猜测密钥
+        size_t total_count = 0;
+        for (int i = 0; i < size; i++) {
+            total_count += temp_counts[i];
+        }
+        all_pairs = malloc(total_count * sizeof(StatePair));
+    }
+
+    MPI_Gatherv(local_pairs, (int)local_count, pair_type, all_pairs, recv_counts, displs, pair_type, 0, MPI_COMM_WORLD);
+
+    // 7. 猜测密钥
+    if (rank == 0) {
+        size_t total_count = 0;
+        for (int i = 0; i < size; i++) {
+            total_count += temp_counts[i];
+        }
+
         int index_diff_word[2];
         int index_diff_word_count = 0;
         for (int i = 0; i < 16; ++i) {
@@ -565,37 +582,33 @@ int main(int argc, char* argv[]) {
         int max_index[1 << 16];
         int max_index_count = 0;
 
-        guess_subkeys(matrix_sbox_table, filtered_pairs, filtered_count, diff_output, index_diff_word, &max_val, &max_index_count, max_index);
+        guess_subkeys(matrix_sbox_table, all_pairs, (int)total_count, diff_output, index_diff_word, &max_val, &max_index_count, max_index);
 
-        //uint8_t right_key1 = key_schedule[round + 1][index_inv[index_diff_word[0]]];
-        //uint8_t right_key2 = key_schedule[round + 1][index_inv[index_diff_word[1]]];
-        //printf("Right key1: 0x%02X, Right key2: 0x%02X\n", right_key1, right_key2); // 大写十六进制输出：0xAB
-        /*for (int i = 0; i < round + 2; ++i) {
-            for (int j = 0; j < 16; ++j) {
-                printf("0x%02X, ", key_schedule[i][j]);
-            }
-            printf("\n");
-        }
-        printf("\n");*/
-
-        // 10. 导出全部候选子密钥
+        // 8. 导出全部候选子密钥
         FILE* fp = fopen("cand_key_0.txt", "w");   // 打开文件，"w" 表示写入模式
 
         // 将数组元素逐个写入文件
-        for (i = 0; i < max_index_count; i++) {
+        for (int i = 0; i < max_index_count; i++) {
             fprintf(fp, "%d\n", max_index[i]);  // 每个元素占一行
         }
 
         fclose(fp);  // 关闭文件
         printf("数组已成功写入到 cand_key_0.txt\n");
-
-        // 11. 释放内存
-        free(all_pairs);
-        free(all_counts);
-        free(displs);
     }
-    free(local_pairs);
 
+    clock_t end = clock();
+    double duration = ((double)(end - start)) / CLOCKS_PER_SEC * 1000.0;
+    printf("循环耗时: %.2f 毫秒\n", duration);
+
+    // 清理内存
+    free(local_pairs);
+    if (rank == 0) {
+        free(recv_counts);
+        free(displs);
+        free(temp_counts);
+        free(all_pairs);
+    }
+    MPI_Type_free(&pair_type);
     MPI_Finalize();
 
     return 0;
