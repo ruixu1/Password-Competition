@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
-#include <omp.h>
+#include <mpi.h>
 
 // Constants
 #define STATE_SIZE 16   // 128位
@@ -378,7 +378,18 @@ void encrypt(const uint8_t plaintext[16], State ciphertext, const KeySchedule ke
     }
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    uint64_t total = ((uint64_t)1 << 32);
+    uint64_t chunk = (total + size - 1) / size;
+    uint64_t my_start = rank * chunk;
+    uint64_t my_end = my_start + chunk;
+    if (my_end > total) my_end = total;
+
     // 1. 读取必要的数据
     int rows[8], cols[8];
     int** cand_key_0 = read_data_int("cand_key_0.txt", 10, &rows[0], &cols[0]);
@@ -453,95 +464,91 @@ int main() {
     }
 
     // 7. 得到2^{32}种全部可能的候选子密钥，并且和生成的明文加密验证得到正确子密钥
-    clock_t start = clock();
-    State key_cand_right = { 0xE3, 0x6C, 0xDB, 0xBF, 0x7F, 0x05, 0x91, 0x05, 0xCF, 0xCC, 0x94, 0x27, 0x02, 0x3D, 0xB9, 0xC2 };
-
-    volatile int found = 0;         // 标志位，线程安全
+    double t1 = MPI_Wtime();
+    int found = 0;
     uint64_t result_index = 0;
     uint8_t result_key[16] = { 0 };
+    State key_cand_right = { 0xE3, 0x6C, 0xDB, 0xBF, 0x7F, 0x05, 0x91, 0x05, 0xCF, 0xCC, 0x94, 0x27, 0x02, 0x3D, 0xB9, 0xC2 };
 
-    #pragma omp parallel
-    {
+    for (uint64_t i = my_start; i < my_end; ++i) {
+        // ... 组装key_cand_local，逆推密钥，验证10组明密文 ...
         State key_cand_local;  // 每个线程自己的key_cand
         KeySchedule key_schedule_inv;
         uint8_t cipher_cand[10][STATE_SIZE];
 
-        #pragma omp for schedule(static)
-        for (uint64_t i = 0; i < ((uint64_t)1 << 32); ++i) {
-            if (found) continue; // 其他线程已经找到
-
-            int index[8];
-            for (int j = 0; j < 8; ++j) {
-                index[j] = (i >> (4 * j)) & 0xF; // 注意加括号
+        int index[8];
+        for (int j = 0; j < 8; ++j) {
+            index[j] = (i >> (4 * j)) & 0xF; // 注意加括号
+        }
+        uint8_t temp[16];
+        temp[0] = cand_key_0[index[0]][0] & 0xFF;
+        temp[1] = (cand_key_0[index[0]][0] >> 8) & 0xFF;
+        temp[2] = cand_key_1[index[1]][0] & 0xFF;
+        temp[3] = (cand_key_1[index[1]][0] >> 8) & 0xFF;
+        temp[4] = cand_key_2[index[2]][0] & 0xFF;
+        temp[5] = (cand_key_2[index[2]][0] >> 8) & 0xFF;
+        temp[6] = cand_key_3[index[3]][0] & 0xFF;
+        temp[7] = (cand_key_3[index[3]][0] >> 8) & 0xFF;
+        temp[8] = cand_key_4[index[4]][0] & 0xFF;
+        temp[9] = (cand_key_4[index[4]][0] >> 8) & 0xFF;
+        temp[10] = cand_key_5[index[5]][0] & 0xFF;
+        temp[11] = (cand_key_5[index[5]][0] >> 8) & 0xFF;
+        temp[12] = cand_key_6[index[6]][0] & 0xFF;
+        temp[13] = (cand_key_6[index[6]][0] >> 8) & 0xFF;
+        temp[14] = cand_key_7[index[7]][0] & 0xFF;
+        temp[15] = (cand_key_7[index[7]][0] >> 8) & 0xFF;
+        for (int j = 0; j < 8; ++j) {
+            for (int k = 0; k < 2; ++k) {
+                key_cand_local[index_inv[index_diff_word[j][k]]] = temp[2 * j + k];
             }
-            uint8_t temp[16];
-            temp[0] = cand_key_0[index[0]][0] & 0xFF;
-            temp[1] = (cand_key_0[index[0]][0] >> 8) & 0xFF;
-            temp[2] = cand_key_1[index[1]][0] & 0xFF;
-            temp[3] = (cand_key_1[index[1]][0] >> 8) & 0xFF;
-            temp[4] = cand_key_2[index[2]][0] & 0xFF;
-            temp[5] = (cand_key_2[index[2]][0] >> 8) & 0xFF;
-            temp[6] = cand_key_3[index[3]][0] & 0xFF;
-            temp[7] = (cand_key_3[index[3]][0] >> 8) & 0xFF;
-            temp[8] = cand_key_4[index[4]][0] & 0xFF;
-            temp[9] = (cand_key_4[index[4]][0] >> 8) & 0xFF;
-            temp[10] = cand_key_5[index[5]][0] & 0xFF;
-            temp[11] = (cand_key_5[index[5]][0] >> 8) & 0xFF;
-            temp[12] = cand_key_6[index[6]][0] & 0xFF;
-            temp[13] = (cand_key_6[index[6]][0] >> 8) & 0xFF;
-            temp[14] = cand_key_7[index[7]][0] & 0xFF;
-            temp[15] = (cand_key_7[index[7]][0] >> 8) & 0xFF;
-            for (int j = 0; j < 8; ++j) {
-                for (int k = 0; k < 2; ++k) {
-                    key_cand_local[index_inv[index_diff_word[j][k]]] = temp[2 * j + k];
+        }
+
+        aes_key_schedule_invert(key_cand_local, matrix_sbox_table, key_schedule_inv);
+
+        // 使用key_schedule_inv验证明密文对
+        bool match = true;
+        for (int j = 0; j < 10; ++j) {
+            encrypt(plain[j], cipher_cand[j], key_schedule_inv, aes_table, matrix_sbox_table, index);
+            match = true;
+            for (int k = 0; k < 16; ++k) {
+                if (cipher_cand[j][k] != cipher[j][k]) {
+                    match = false;
+                    break;
                 }
             }
+            if (!match) break;
+        }
 
-            aes_key_schedule_invert(key_cand_local, matrix_sbox_table, key_schedule_inv);
-
-            // 使用key_schedule_inv验证明密文对
-            bool match = true;
-            for (int j = 0; j < 10; ++j) {
-                encrypt(plain[j], cipher_cand[j], key_schedule_inv, aes_table, matrix_sbox_table, index);
-                match = true;
-                for (int k = 0; k < 16; ++k) {
-                    if (cipher_cand[j][k] != cipher[j][k]) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (!match) break;
-            }
-
-            if (match) {
-                // 抢答写全局结果
-                #pragma omp critical
-                {
-                    if (!found) {
-                        found = 1;
-                        result_index = i;
-                        memcpy(result_key, key_cand_local, 16);
-                    }
+        if (match) {
+            // 抢答写全局结果
+            {
+                if (!found) {
+                    found = 1;
+                    result_index = i;
+                    memcpy(result_key, key_cand_local, 16);
                 }
             }
+        }
+        if (match) {
+            found = 1;
+            result_index = i;
+            memcpy(result_key, key_cand_local, 16);
+            break; // 本进程提前退出
         }
     }
 
+    double t2 = MPI_Wtime();
+
     if (found) {
-        printf("The correct index is : %" PRIu64 "\n", result_index);
-        printf("The correct sub key is : ");
-        for (int j = 0; j < 16; ++j) {
-            printf("0x%02X, ", result_key[j]);
-        }
+        printf("Rank %d found key! index=%" PRIu64 "\n", rank, result_index);
+        printf("Key: ");
+        for (j = 0; j < 16; ++j) printf("0x%02X, ", result_key[j]);
         printf("\n");
+        printf("耗时: %.2f ms\n", (t2 - t1) * 1000.0);
     }
     else {
         printf("No matching key found.\n");
     }
-
-    clock_t end = clock();
-    double duration = ((double)(end - start)) / CLOCKS_PER_SEC * 1000.0;
-    printf("循环耗时: %.2f 毫秒\n", duration);
 
     // 8. 释放内存
     for (int i = 0; i < rows[0]; i++) free(cand_key_0[i]);
@@ -560,6 +567,9 @@ int main() {
     free(cand_key_5);
     free(cand_key_6);
     free(cand_key_7);
+
+    MPI_Finalize();
+    return 0;
 
     return 0;
 }
