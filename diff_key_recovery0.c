@@ -6,17 +6,17 @@
 #include <time.h>
 #include <stdint.h>
 #include <stdbool.h>
-//#include <omp.h>
+#include <omp.h>
 #include <mpi.h>
 
 // Constants
 #define STATE_SIZE 16   // 128位
 #define BYTE_SIZE 8
-#define BATCH_SIZE 1024  // 将批处理大小定义为常量
+#define BATCH_SIZE 4096  // 将批处理大小定义为常量
 #define MAX_LINE_LENGTH 1024
-#define MAX_PAIRS (1ULL<<32)
+#define MAX_PAIRS (1ULL<<36)
 //#define MAX_PAIRS 10000000
-#define round 100
+#define round 120
 #define MAX_FILTERED_PAIRS 10000  // 最多在内存中保留多少对通过筛选的明密文对
 #define AES_TABLE_ROW(OUT_IDX, T0, T1, T2, T3, IN_IDX_0, IN_IDX_1, IN_IDX_2, IN_IDX_3) \
     ciphertext[OUT_IDX] = aes_table[T0][c_temp[IN_IDX_0]] ^ \
@@ -376,6 +376,7 @@ void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_b
         size_t batch_count = (i + BATCH_SIZE > my_end) ? (my_end - i) : BATCH_SIZE;
 
         // 1. 批量生成明文对
+        #pragma omp parallel for
         for (j = 0; j < batch_count; ++j) {
             // 每次用prng生成128位明文
             uint64_t r1 = xoshiro256plusplus_next(&prng);
@@ -389,18 +390,22 @@ void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_b
         }
 
         // 2. 批量加密
+        #pragma omp parallel for
         for (j = 0; j < batch_count; ++j) {
             encrypt(batch[j].first, c1[j], key_schedule, aes_table, matrix_sbox_table, index);
             encrypt(batch[j].second, c2[j], key_schedule, aes_table, matrix_sbox_table, index);
         }
 
         // 3. 批量过滤
+        #pragma omp parallel for
         for (j = 0; j < batch_count; ++j) {
             if (pass_filter(c1[j], c2[j], diff_output)) {
-                if (local_count < max_filtered_count) {  // 使用传入的max_filtered_count
-                    memcpy(filtered_pairs[local_count].first, c1[j], STATE_SIZE);
-                    memcpy(filtered_pairs[local_count].second, c2[j], STATE_SIZE);
-                    local_count++;
+                int pos;
+                #pragma omp atomic capture
+                pos = local_count++;
+                if (pos < max_filtered_count) {
+                    memcpy(filtered_pairs[pos].first, c1[j], STATE_SIZE);
+                    memcpy(filtered_pairs[pos].second, c2[j], STATE_SIZE);
                 }
             }
         }
@@ -477,6 +482,7 @@ void guess_subkeys(const uint8_t matrix_sbox_table[256], const StatePair* pairs_
 }
 
 int main(int argc, char* argv[]) {
+    omp_set_num_threads(16); // 或由环境变量控制
     MPI_Init(&argc, &argv);
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
