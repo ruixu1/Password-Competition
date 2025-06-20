@@ -1,4 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
+#include "xoshiro256plusplus.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,22 +32,37 @@ typedef struct {
     State second;
 } StatePair;
 
+// 错误处理宏
+#define MPI_CHECK(call) \
+    do { \
+        int err = call; \
+        if (err != MPI_SUCCESS) { \
+            char error_string[MPI_MAX_ERROR_STRING]; \
+            int length; \
+            MPI_Error_string(err, error_string, &length); \
+            fprintf(stderr, "MPI error at %s:%d: %s\n", __FILE__, __LINE__, error_string); \
+            MPI_Abort(MPI_COMM_WORLD, err); \
+        } \
+    } while (0)
+
 // Function declarations
 // 函数原型声明部分
 void* check_malloc(size_t size);
 int** read_data_int(const char* filename, int base, int* rows, int* cols);
-void compute_diff_output(int* diff_word, int** diff_sol, int** matrix_sol, const int index[], uint8_t diff_output[16]);
 void print_state(State diff);
-void build_lookup_tables(int** matrix_sol, uint8_t matrix_sol_table[256], uint8_t xtime_table[256]);
-void sub_bytes(State s, uint8_t* table);
-void shift_rows(State state);
-void build_table_aes(uint8_t* sbox_table, uint8_t* time_table, uint8_t**** aes_table);
-void generate_rcon(uint8_t* rcon);
-void key_expansion(const uint8_t* key, uint8_t* table, KeySchedule round_keys);
-void extract_index_diff_word(int* diff_word, int index_diff_word[2], int* index_diff_word_count);
-void aes_key_schedule_invert(const State last_round_key, uint8_t* table, KeySchedule round_keys);
-void encrypt(State plaintext, State ciphertext, const KeySchedule key_schedule, uint8_t*** aes_table, uint8_t* matrix_sol_table);
-
+void broadcast_matrix(int** matrix, int rows, int cols, int root, MPI_Comm comm);
+void build_lookup_tables(const uint8_t matrix_sol[8], uint8_t matrix_sol_table[256], uint8_t matrix_sbox_table[256], uint8_t xtime_table[256]);
+void compute_diff_output(const uint8_t diff_word[16], const uint8_t diff_sol[16], const uint8_t matrix_sol_table[256], const int index[16], State diff_output);
+void build_table_aes(const uint8_t matrix_sbox_table[256], const uint8_t time_table[256], uint8_t aes_table[16][256]);
+void generate_rcon(uint8_t rcon[round + 2]);
+void key_expansion(const uint8_t key[16], const uint8_t matrix_sbox_table[256], const uint8_t rcon[round + 2], KeySchedule round_keys);
+static uint64_t splitmix64(uint64_t* x);
+void xoshiro256plusplus_init(xoshiro256plusplus_state* state, uint64_t seed, uint64_t thread_id);
+static inline uint64_t rotl(const uint64_t x, int k);
+uint64_t xoshiro256plusplus_next(xoshiro256plusplus_state* state);
+void extract_index_diff_word(const State diff_word, int index_diff_word[2], int* index_diff_word_count);
+void aes_key_schedule_invert(const State last_round_key, const uint8_t matrix_sbox_table[256], KeySchedule round_keys);
+void encrypt(const uint8_t plaintext[16], State ciphertext, const KeySchedule key_schedule, const uint8_t aes_table[16][256], const uint8_t matrix_sbox_table[256], const int index[16]);
 
 
 // Function declarations
@@ -115,6 +131,29 @@ void print_state(State diff) {
     printf("\n");
 }
 
+// 广播矩阵数据到所有进程
+void broadcast_matrix(int** matrix, int rows, int cols, int root, MPI_Comm comm) {
+    int rank;
+    MPI_Comm_rank(comm, &rank);
+
+    // 广播矩阵维度
+    int dims[2] = { rows, cols };
+    MPI_CHECK(MPI_Bcast(dims, 2, MPI_INT, root, comm));
+
+    // 非root进程分配内存
+    if (rank != root) {
+        matrix = (int**)check_malloc(dims[0] * sizeof(int*));
+        for (int i = 0; i < dims[0]; i++) {
+            matrix[i] = (int*)check_malloc(dims[1] * sizeof(int));
+        }
+    }
+
+    // 广播数据
+    for (int i = 0; i < dims[0]; i++) {
+        MPI_CHECK(MPI_Bcast(matrix[i], dims[1], MPI_INT, root, comm));
+    }
+}
+
 // 拆出 lookup tables 构建
 void build_lookup_tables(const uint8_t matrix_sol[8], uint8_t matrix_sol_table[256], uint8_t matrix_sbox_table[256], uint8_t xtime_table[256]) {
     int i, j;
@@ -145,9 +184,9 @@ void build_lookup_tables(const uint8_t matrix_sol[8], uint8_t matrix_sol_table[2
 }
 
 // 拆出 diff_output 计算函数
-void compute_diff_output(const uint8_t diff_word[16], const uint8_t diff_sol[16], const uint8_t matrix_sol_table[256], State diff_output) {
+void compute_diff_output(const uint8_t diff_word[16], const uint8_t diff_sol[16], const uint8_t matrix_sol_table[256], const int index[16], State diff_output) {
     for (int i = 0; i < 16; ++i) {
-        uint8_t diff_temp = diff_sol[i] ^ diff_word[i];
+        uint8_t diff_temp = diff_sol[index[i]] ^ diff_word[index[i]];
         diff_output[i] = matrix_sol_table[diff_temp];
     }
 }
@@ -253,17 +292,6 @@ static inline uint64_t rotl(const uint64_t x, int k) {
     return (x << k) | (x >> (64 - k));
 }
 
-// 给定diff_word_0，生成对应索引集合diff_word_temp_0
-void extract_index_diff_word(const State diff_word, int index_diff_word[2], int* index_diff_word_count) {
-    *index_diff_word_count = 0;
-    for (int i = 0; i < 16; ++i) {
-        if (diff_word[i]) {
-            index_diff_word[*index_diff_word_count] = i;
-            (*index_diff_word_count)++;
-        }
-    }
-}
-
 // xoshiro256plusplus随机数生成函数
 uint64_t xoshiro256plusplus_next(xoshiro256plusplus_state* state) {
     uint64_t* s = state->s;
@@ -281,6 +309,17 @@ uint64_t xoshiro256plusplus_next(xoshiro256plusplus_state* state) {
     s[3] = rotl(s[3], 45);
 
     return result;
+}
+
+// 给定diff_word_0，生成对应索引集合diff_word_temp_0
+void extract_index_diff_word(const State diff_word, int index_diff_word[2], int* index_diff_word_count) {
+    *index_diff_word_count = 0;
+    for (int i = 0; i < 16; ++i) {
+        if (diff_word[i]) {
+            index_diff_word[*index_diff_word_count] = i;
+            (*index_diff_word_count)++;
+        }
+    }
 }
 
 // 逆密钥编排，需要S盒查找表和Rcon表
@@ -404,7 +443,6 @@ int main(int argc, char* argv[]) {
 
     // 2. 初始化变量和数据结构
     srand((unsigned int)time(NULL));
-    int i, j;
     State diff_word_0 = { 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0 };
     State diff_word_1 = { 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 };
     State diff_word_2 = { 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0 };
@@ -449,13 +487,13 @@ int main(int argc, char* argv[]) {
     // 6. 随机生成10组明文并且加密得到对应密文
 	uint8_t plain[10][STATE_SIZE];
     uint8_t cipher[10][STATE_SIZE];
-    for (i = 0; i < 10; ++i) {
+    for (int i = 0; i < 10; ++i) {
         xoshiro256plusplus_state prng;
         xoshiro256plusplus_init(&prng, global_seed, i + 1);
         uint64_t r1 = xoshiro256plusplus_next(&prng);
         uint64_t r2 = xoshiro256plusplus_next(&prng);
 
-        for (j = 0; j < 8; ++j) {
+        for (int j = 0; j < 8; ++j) {
             plain[i][j] = (r1 >> (8 * j)) & 0xFF;
             plain[i][j + 8] = (r2 >> (8 * j)) & 0xFF;
         }
@@ -468,7 +506,7 @@ int main(int argc, char* argv[]) {
     int found = 0;
     uint64_t result_index = 0;
     uint8_t result_key[16] = { 0 };
-    State key_cand_right = { 0xE3, 0x6C, 0xDB, 0xBF, 0x7F, 0x05, 0x91, 0x05, 0xCF, 0xCC, 0x94, 0x27, 0x02, 0x3D, 0xB9, 0xC2 };
+    State key_cand_right = { 0x5A, 0x5C, 0x8D, 0xCA, 0x6C, 0x88, 0xA4, 0xB0, 0x47, 0x50, 0x9B, 0x36, 0xDB, 0xD6, 0x2F, 0x38 };
 
     for (uint64_t i = my_start; i < my_end; ++i) {
         // ... 组装key_cand_local，逆推密钥，验证10组明密文 ...
@@ -476,27 +514,27 @@ int main(int argc, char* argv[]) {
         KeySchedule key_schedule_inv;
         uint8_t cipher_cand[10][STATE_SIZE];
 
-        int index[8];
+        int cand_key_index[8];
         for (int j = 0; j < 8; ++j) {
-            index[j] = (i >> (4 * j)) & 0xF; // 注意加括号
+            cand_key_index[j] = (i >> (4 * j)) & 0xF; // 注意加括号
         }
         uint8_t temp[16];
-        temp[0] = cand_key_0[index[0]][0] & 0xFF;
-        temp[1] = (cand_key_0[index[0]][0] >> 8) & 0xFF;
-        temp[2] = cand_key_1[index[1]][0] & 0xFF;
-        temp[3] = (cand_key_1[index[1]][0] >> 8) & 0xFF;
-        temp[4] = cand_key_2[index[2]][0] & 0xFF;
-        temp[5] = (cand_key_2[index[2]][0] >> 8) & 0xFF;
-        temp[6] = cand_key_3[index[3]][0] & 0xFF;
-        temp[7] = (cand_key_3[index[3]][0] >> 8) & 0xFF;
-        temp[8] = cand_key_4[index[4]][0] & 0xFF;
-        temp[9] = (cand_key_4[index[4]][0] >> 8) & 0xFF;
-        temp[10] = cand_key_5[index[5]][0] & 0xFF;
-        temp[11] = (cand_key_5[index[5]][0] >> 8) & 0xFF;
-        temp[12] = cand_key_6[index[6]][0] & 0xFF;
-        temp[13] = (cand_key_6[index[6]][0] >> 8) & 0xFF;
-        temp[14] = cand_key_7[index[7]][0] & 0xFF;
-        temp[15] = (cand_key_7[index[7]][0] >> 8) & 0xFF;
+        temp[0] = cand_key_0[cand_key_index[0]][0] & 0xFF;
+        temp[1] = (cand_key_0[cand_key_index[0]][0] >> 8) & 0xFF;
+        temp[2] = cand_key_1[cand_key_index[1]][0] & 0xFF;
+        temp[3] = (cand_key_1[cand_key_index[1]][0] >> 8) & 0xFF;
+        temp[4] = cand_key_2[cand_key_index[2]][0] & 0xFF;
+        temp[5] = (cand_key_2[cand_key_index[2]][0] >> 8) & 0xFF;
+        temp[6] = cand_key_3[cand_key_index[3]][0] & 0xFF;
+        temp[7] = (cand_key_3[cand_key_index[3]][0] >> 8) & 0xFF;
+        temp[8] = cand_key_4[cand_key_index[4]][0] & 0xFF;
+        temp[9] = (cand_key_4[cand_key_index[4]][0] >> 8) & 0xFF;
+        temp[10] = cand_key_5[cand_key_index[5]][0] & 0xFF;
+        temp[11] = (cand_key_5[cand_key_index[5]][0] >> 8) & 0xFF;
+        temp[12] = cand_key_6[cand_key_index[6]][0] & 0xFF;
+        temp[13] = (cand_key_6[cand_key_index[6]][0] >> 8) & 0xFF;
+        temp[14] = cand_key_7[cand_key_index[7]][0] & 0xFF;
+        temp[15] = (cand_key_7[cand_key_index[7]][0] >> 8) & 0xFF;
         for (int j = 0; j < 8; ++j) {
             for (int k = 0; k < 2; ++k) {
                 key_cand_local[index_inv[index_diff_word[j][k]]] = temp[2 * j + k];
@@ -520,16 +558,6 @@ int main(int argc, char* argv[]) {
         }
 
         if (match) {
-            // 抢答写全局结果
-            {
-                if (!found) {
-                    found = 1;
-                    result_index = i;
-                    memcpy(result_key, key_cand_local, 16);
-                }
-            }
-        }
-        if (match) {
             found = 1;
             result_index = i;
             memcpy(result_key, key_cand_local, 16);
@@ -542,7 +570,7 @@ int main(int argc, char* argv[]) {
     if (found) {
         printf("Rank %d found key! index=%" PRIu64 "\n", rank, result_index);
         printf("Key: ");
-        for (j = 0; j < 16; ++j) printf("0x%02X, ", result_key[j]);
+        for (int j = 0; j < 16; ++j) printf("0x%02X, ", result_key[j]);
         printf("\n");
         printf("耗时: %.2f ms\n", (t2 - t1) * 1000.0);
     }
