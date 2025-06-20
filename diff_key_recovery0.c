@@ -14,9 +14,9 @@
 #define BYTE_SIZE 8
 #define BATCH_SIZE 1024  // 将批处理大小定义为常量
 #define MAX_LINE_LENGTH 1024
-#define MAX_PAIRS (1ULL<<36)
+#define MAX_PAIRS (1ULL<<32)
 //#define MAX_PAIRS 10000000
-#define round 140
+#define round 100
 #define MAX_FILTERED_PAIRS 10000  // 最多在内存中保留多少对通过筛选的明密文对
 #define AES_TABLE_ROW(OUT_IDX, T0, T1, T2, T3, IN_IDX_0, IN_IDX_1, IN_IDX_2, IN_IDX_3) \
     ciphertext[OUT_IDX] = aes_table[T0][c_temp[IN_IDX_0]] ^ \
@@ -53,7 +53,7 @@ void* check_malloc(size_t size);
 void print_state(State diff);
 void broadcast_matrix(int** matrix, int rows, int cols, int root, MPI_Comm comm);
 void build_lookup_tables(const uint8_t matrix_sol[8], uint8_t matrix_sol_table[256], uint8_t matrix_sbox_table[256], uint8_t xtime_table[256]);
-void compute_diff_output(const uint8_t diff_word[16], const uint8_t diff_sol[16], const uint8_t matrix_sol_table[256], State diff_output);
+void compute_diff_output(const uint8_t diff_word[16], const uint8_t diff_sol[16], const uint8_t matrix_sol_table[256], const int index[16], State diff_output);
 void build_table_aes(const uint8_t matrix_sbox_table[256], const uint8_t time_table[256], uint8_t aes_table[16][256]);
 void generate_rcon(uint8_t rcon[round + 2]);
 void key_expansion(const uint8_t key[16], const uint8_t matrix_sbox_table[256], const uint8_t rcon[round + 2], KeySchedule round_keys);
@@ -138,9 +138,9 @@ void build_lookup_tables(const uint8_t matrix_sol[8], uint8_t matrix_sol_table[2
 }
 
 // 拆出 diff_output 计算函数
-void compute_diff_output(const uint8_t diff_word[16], const uint8_t diff_sol[16], const uint8_t matrix_sol_table[256], State diff_output) {
+void compute_diff_output(const uint8_t diff_word[16], const uint8_t diff_sol[16], const uint8_t matrix_sol_table[256], const int index[16], State diff_output) {
     for (int i = 0; i < 16; ++i) {
-        uint8_t diff_temp = diff_sol[i] ^ diff_word[i];
+        uint8_t diff_temp = diff_sol[index[i]] ^ diff_word[index[i]];
         diff_output[i] = matrix_sol_table[diff_temp];
     }
 }
@@ -503,8 +503,8 @@ int main(int argc, char* argv[]) {
 
     // 3. 计算 diff_output
     State diff_output;
-    compute_diff_output(diff_word, diff_sol, matrix_sol_table, diff_output);
-    print_state(diff_output);    
+    compute_diff_output(diff_word, diff_sol, matrix_sol_table, index, diff_output);
+    print_state(diff_output);
 
     // 4. 生成主密钥以及密钥拓展
     // 生成轮常数rcon
@@ -515,18 +515,25 @@ int main(int argc, char* argv[]) {
     KeySchedule key_schedule;
     key_expansion(key, matrix_sbox_table, rcon, key_schedule);
 
-    clock_t start = clock();
-
     // 5. 各进程独立生成、加密、筛选
     // 创建MPI派生类型
     MPI_Datatype pair_type;
     MPI_Type_contiguous(32, MPI_BYTE, &pair_type);
     MPI_Type_commit(&pair_type);
 
+    MPI_Barrier(MPI_COMM_WORLD); // 所有进程同步，开始计时
+    double t_start = MPI_Wtime();
+
     StatePair* local_pairs = malloc(MAX_FILTERED_PAIRS * sizeof(StatePair));
     size_t local_count = 0;
 
     generate_encrypt_and_filter_stream(MAX_PAIRS, diff_sol, key_schedule, aes_table, matrix_sbox_table, diff_output, index, local_pairs, &local_count, MAX_FILTERED_PAIRS, global_seed, rank, size);
+
+    MPI_Barrier(MPI_COMM_WORLD); // 所有进程结束主计算
+    double t_end = MPI_Wtime();
+    if (rank == 0) {
+        printf("主计算部分耗时: %.2f 毫秒\n", (t_end - t_start) * 1000.0);
+    }
 
     // 6. 汇总所有进程筛选结果
     int* recv_counts = NULL;
@@ -595,10 +602,6 @@ int main(int argc, char* argv[]) {
         fclose(fp);  // 关闭文件
         printf("数组已成功写入到 cand_key_0.txt\n");
     }
-
-    clock_t end = clock();
-    double duration = ((double)(end - start)) / CLOCKS_PER_SEC * 1000.0;
-    printf("循环耗时: %.2f 毫秒\n", duration);
 
     // 清理内存
     free(local_pairs);
