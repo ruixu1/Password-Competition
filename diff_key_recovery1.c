@@ -491,9 +491,9 @@ int main(int argc, char* argv[]) {
     srand((unsigned int)time(NULL));
     int index[] = { 0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11 };
     int index_inv[] = { 0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3 };
-    State diff_sol = { 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    State diff_plain = { 0x26, 0x00, 0xf7, 0x00, 0x00, 0x9f, 0x00, 0x01, 0x26, 0x00, 0xf7, 0x00, 0x00, 0x9f, 0x00, 0x01 };
-    State diff_word = { 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0 };
+    State diff_sol = { 0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00 };
+    State diff_plain = { 0x01, 0x00, 0x9f, 0x00, 0x00, 0x26, 0x00, 0xf7, 0x01, 0x00, 0x9f, 0x00, 0x00, 0x26, 0x00, 0xf7 };
+    State diff_word = { 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 };
     uint8_t matrix_sol[] = { 0x97, 0x92, 0x94, 0x98, 0x10, 0x20, 0x40, 0x80 };
     uint64_t global_seed = 0xC7E6A3B2F19D4E58ULL; // 全局种子，用于xoshiro256plusplus初始化
 
@@ -597,7 +597,7 @@ int main(int argc, char* argv[]) {
         guess_subkeys(matrix_sbox_table, all_pairs, (int)total_count, diff_output, index_diff_word, &max_val, &max_index_count, max_index);
 
         // 8. 导出全部候选子密钥
-        FILE* fp = fopen("cand_key_0.txt", "w");   // 打开文件，"w" 表示写入模式
+        FILE* fp = fopen("cand_key_1.txt", "w");   // 打开文件，"w" 表示写入模式
 
         // 将数组元素逐个写入文件
         for (int i = 0; i < max_index_count; i++) {
@@ -605,7 +605,7 @@ int main(int argc, char* argv[]) {
         }
 
         fclose(fp);  // 关闭文件
-        printf("数组已成功写入到 cand_key_0.txt\n");
+        printf("数组已成功写入到 cand_key_1.txt\n");
     }
 
     // 清理内存
