@@ -14,9 +14,9 @@
 #define BYTE_SIZE 8
 #define BATCH_SIZE 4096  // 将批处理大小定义为常量
 #define MAX_LINE_LENGTH 1024
-#define MAX_PAIRS (1ULL<<32)
+#define MAX_PAIRS (1ULL<<43)
 //#define MAX_PAIRS 10000000
-#define round 101
+#define round 169
 #define MAX_FILTERED_PAIRS 10000  // 最多在内存中保留多少对通过筛选的明密文对
 #define AES_TABLE_ROW(OUT_IDX, T0, T1, T2, T3, IN_IDX_0, IN_IDX_1, IN_IDX_2, IN_IDX_3) \
     ciphertext[OUT_IDX] = aes_table[T0][c_temp[IN_IDX_0]] ^ \
@@ -26,7 +26,7 @@
 
 // Type definitions
 typedef uint8_t State[STATE_SIZE];
-typedef uint8_t KeySchedule[round + 3][16];
+typedef uint8_t KeySchedule[round + 2][16];
 
 // Structure definitions
 typedef struct {
@@ -186,7 +186,7 @@ void generate_rcon(uint8_t rcon[round + 2]) {
 }
 
 // 密钥扩展函数
-void key_expansion(const uint8_t key[16], const uint8_t matrix_sbox_table[256], const uint8_t rcon[round + 3], KeySchedule round_keys) {
+void key_expansion(const uint8_t key[16], const uint8_t matrix_sbox_table[256], const uint8_t rcon[round + 2], KeySchedule round_keys) {
     int j;
 
     // 拷贝初始密钥
@@ -338,7 +338,7 @@ void encrypt(const uint8_t plaintext[16], State ciphertext, const KeySchedule ke
         ciphertext[i] = matrix_sbox_table[temp[i]];
     }
     for (j = 0; j < 16; ++j) {
-        ciphertext[j] ^= key_schedule[round + 2][j];
+        ciphertext[j] ^= key_schedule[round + 1][j];
     }
 }
 
