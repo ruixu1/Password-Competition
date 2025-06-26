@@ -6,32 +6,29 @@
 #include <time.h>
 #include <stdint.h>
 #include <stdbool.h>
-//#include <omp.h>
+#include <inttypes.h>
 #include <mpi.h>
 
 // Constants
 #define STATE_SIZE 16   // 128位
 #define BYTE_SIZE 8
-#define BATCH_SIZE 4096  // 将批处理大小定义为常量
+#define BATCH_SIZE 1024  // 将批处理大小定义为常量
 #define MAX_LINE_LENGTH 1024
-#define MAX_PAIRS (1ULL<<43)
-//#define MAX_PAIRS 10000000
-#define round 169
+//#define MAX_PAIRS (1ULL<<45)
+#define MAX_PAIRS 500000
+#define round 21
 #define MAX_FILTERED_PAIRS 10000  // 最多在内存中保留多少对通过筛选的明密文对
-#define AES_TABLE_ROW(OUT_IDX, T0, T1, T2, T3, IN_IDX_0, IN_IDX_1, IN_IDX_2, IN_IDX_3) \
-    ciphertext[OUT_IDX] = aes_table[T0][c_temp[IN_IDX_0]] ^ \
-                          aes_table[T1][c_temp[IN_IDX_1]] ^ \
-                          aes_table[T2][c_temp[IN_IDX_2]] ^ \
-                          aes_table[T3][c_temp[IN_IDX_3]]
+#define AES_TTABLE_ROW(out, t0, t1, t2, t3, rk) \
+    (T0[(t0)] ^ T1[(t1)] ^ T2[(t2)] ^ T3[(t3)] ^ (rk))
 
 // Type definitions
-typedef uint8_t State[STATE_SIZE];
-typedef uint8_t KeySchedule[round + 2][16];
+typedef uint8_t State[16] __attribute__((aligned(8)));
+typedef uint8_t KeySchedule[round + 2][16] __attribute__((aligned(8)));
 
 // Structure definitions
-typedef struct {
-    State first;
-    State second;
+typedef struct __attribute__((aligned(16))) {
+    uint8_t first[16];
+    uint8_t second[16];
 } StatePair;
 
 // 错误处理宏
@@ -49,34 +46,25 @@ typedef struct {
 
 // Function declarations
 // 函数原型声明部分
-void* check_malloc(size_t size);
 void print_state(State diff);
-void broadcast_matrix(int** matrix, int rows, int cols, int root, MPI_Comm comm);
 void build_lookup_tables(const uint8_t matrix_sol[8], uint8_t matrix_sol_table[256], uint8_t matrix_sbox_table[256], uint8_t xtime_table[256]);
-void compute_diff_output(const uint8_t diff_word[16], const uint8_t diff_sol[16], const uint8_t matrix_sol_table[256], const int index[16], State diff_output);
-void build_table_aes(const uint8_t matrix_sbox_table[256], const uint8_t time_table[256], uint8_t aes_table[16][256]);
+void build_table_aes(const uint8_t matrix_sbox_table[256], const uint8_t time_table[256]);
 void generate_rcon(uint8_t rcon[round + 2]);
 void key_expansion(const uint8_t key[16], const uint8_t matrix_sbox_table[256], const uint8_t rcon[round + 2], KeySchedule round_keys);
-static uint64_t splitmix64(uint64_t* x);
+static inline uint64_t splitmix64(uint64_t* x);
 void xoshiro256plusplus_init(xoshiro256plusplus_state* state, uint64_t seed, uint64_t thread_id);
 static inline uint64_t rotl(const uint64_t x, int k);
 uint64_t xoshiro256plusplus_next(xoshiro256plusplus_state* state);
-void generate_pair(StatePair* pair, const uint8_t diff_bites[16], xoshiro256plusplus_state* prng);
-void encrypt(const uint8_t plaintext[16], State ciphertext, const KeySchedule key_schedule, const uint8_t aes_table[16][256], const uint8_t matrix_sbox_table[256], const int index[16]);
-bool pass_filter(const uint8_t c1[16], const uint8_t c2[16], const uint8_t diff_output[16]);
-void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_bites[16], const KeySchedule key_schedule, const uint8_t aes_table[16][256], const uint8_t matrix_sbox_table[256], const uint8_t diff_output[16], const int index[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count, uint64_t global_seed, int mpi_rank, int mpi_size);
-void guess_subkeys(const uint8_t matrix_sbox_table[256], const StatePair* pairs_cand, int pairs_cand_count, const uint8_t diff_output[16], const int index_diff_word[2], int* max_val, int* max_index_count, int* max_index);
+void encrypt(const uint8_t plaintext[16], uint8_t ciphertext[16], const uint32_t key_schedule_32[round + 2][4], const KeySchedule key_schedule, const uint8_t matrix_sbox_table[256]);
+bool pass_filter(const uint8_t c1[16], const uint8_t c2[16], const uint64_t diff_output_64[2]);
+void generate_encrypt_and_filter_stream(size_t total_pairs, const uint64_t diff_bites[2], const uint32_t key_schedule_32[round + 2][4], const KeySchedule key_schedule, const uint8_t matrix_sbox_table[256], const uint64_t diff_output_64[2], StatePair* batch, StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count, uint64_t global_seed, int mpi_rank, int mpi_size);
+void guess_subkeys(const uint8_t matrix_sbox_table[256], const StatePair* pairs_cand, int pairs_cand_count, const int index_diff_word[2], int* max_val, int* max_index_count, int* max_index);
 
-
-// Function declarations
-void* check_malloc(size_t size) {
-    void* ptr = malloc(size);
-    if (ptr == NULL) {
-        fprintf(stderr, "Memory allocation failed\n");
-        exit(1);
-    }
-    return ptr;
-}
+// 全局变量定义（main函数之外）
+uint32_t T0[256], T1[256], T2[256], T3[256];
+int row_idx[16] = { 0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11 };
+int row_idx_inv[16] = { 0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3 };
+uint8_t diff_output[16] = { 0x00, 0x00, 0x4e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4e, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
 void print_state(State diff) {
     for (int i = 0; i < 16; ++i) {
@@ -85,90 +73,63 @@ void print_state(State diff) {
     printf("\n");
 }
 
-// 广播矩阵数据到所有进程
-void broadcast_matrix(int** matrix, int rows, int cols, int root, MPI_Comm comm) {
-    int rank;
-    MPI_Comm_rank(comm, &rank);
-
-    // 广播矩阵维度
-    int dims[2] = { rows, cols };
-    MPI_CHECK(MPI_Bcast(dims, 2, MPI_INT, root, comm));
-
-    // 非root进程分配内存
-    if (rank != root) {
-        matrix = (int**)check_malloc(dims[0] * sizeof(int*));
-        for (int i = 0; i < dims[0]; i++) {
-            matrix[i] = (int*)check_malloc(dims[1] * sizeof(int));
-        }
-    }
-
-    // 广播数据
-    for (int i = 0; i < dims[0]; i++) {
-        MPI_CHECK(MPI_Bcast(matrix[i], dims[1], MPI_INT, root, comm));
-    }
-}
-
 // 拆出 lookup tables 构建
 void build_lookup_tables(const uint8_t matrix_sol[8], uint8_t matrix_sol_table[256], uint8_t matrix_sbox_table[256], uint8_t xtime_table[256]) {
     int i, j;
-    for (i = 0; i < 256; i++) {
-        uint8_t temp1 = i, temp_value = 0;
-        if (i == 0) temp1 = 1;
-        else if (i == 1) temp1 = 0;
-
-        for (j = 0; j < 8; j++) {
-            if (__builtin_parity(matrix_sol[j] & i)) {
-                temp_value |= (1 << j);
-            }
-        }
-        matrix_sol_table[i] = temp_value;
-
+    // 1. 先预算基向量的映射
+    uint8_t base[8];
+	uint8_t temp1, temp_value;
+    for (i = 0; i < 8; ++i) {
+        // 只设置第k位，其它为0
+        temp1 = (1 << i);
         temp_value = 0;
-        for (j = 0; j < 8; j++) {
+        for (j = 0; j < 8; ++j) {
             if (__builtin_parity(matrix_sol[j] & temp1)) {
                 temp_value |= (1 << j);
             }
         }
-        matrix_sbox_table[i] = temp_value;
+        base[i] = temp_value; // base[i] = matrix_sol * (1 << i)
     }
 
-    for (i = 0; i < 256; i++) {
+    // 2. 用基向量异或展开所有x
+    for (i = 0; i < 256; ++i) {
+        temp_value = 0;
+        for (j = 0; j < 8; ++j) {
+            if (i & (1 << j)) {
+                temp_value ^= base[j];
+            }
+        }
+        matrix_sol_table[i] = temp_value;
+    }
+
+    // 3. matrix_sbox_table[x] = matrix_sol_table[simple_swap(x)]
+    // 你原来是 i==0 <-> 1，其它不变
+    matrix_sbox_table[0] = matrix_sol_table[1];
+    matrix_sbox_table[1] = matrix_sol_table[0];
+    for (i = 2; i < 256; ++i) {
+        matrix_sbox_table[i] = matrix_sol_table[i];
+    }
+
+    // 4. xtime_table
+    for (i = 0; i < 256; ++i) {
         xtime_table[i] = (i << 1) ^ ((i & 0x80) ? 0x1B : 0x00);
     }
 }
 
-// 拆出 diff_output 计算函数
-void compute_diff_output(const uint8_t diff_word[16], const uint8_t diff_sol[16], const uint8_t matrix_sol_table[256], const int index[16], State diff_output) {
-    for (int i = 0; i < 16; ++i) {
-        uint8_t diff_temp = diff_sol[index[i]] ^ diff_word[index[i]];
-        diff_output[i] = matrix_sol_table[diff_temp];
-    }
-}
-
 // 表格构建函数
-void build_table_aes(const uint8_t matrix_sbox_table[256], const uint8_t time_table[256], uint8_t aes_table[16][256]) {
-    for (int i = 0; i < 256; i++) {
-        uint8_t x = matrix_sbox_table[i];
-        uint8_t tx = time_table[x];
-        uint8_t tx_x = tx ^ x;
-
-        // 列混淆
-        aes_table[0][i] = tx;
-        aes_table[1][i] = x;
-        aes_table[2][i] = x;
-        aes_table[3][i] = tx_x;
-        aes_table[4][i] = tx_x;
-        aes_table[5][i] = tx;
-        aes_table[6][i] = x;
-        aes_table[7][i] = x;
-        aes_table[8][i] = x;
-        aes_table[9][i] = tx_x;
-        aes_table[10][i] = tx;
-        aes_table[11][i] = x;
-        aes_table[12][i] = x;
-        aes_table[13][i] = x;
-        aes_table[14][i] = tx_x;
-        aes_table[15][i] = tx;
+void build_table_aes(const uint8_t matrix_sbox_table[256], const uint8_t time_table[256]) {
+    int i;
+    uint8_t x, tx, tx_x;
+    for (i = 0; i < 256; ++i) {
+        x = matrix_sbox_table[i];
+        tx = time_table[x];
+        tx_x = tx ^ x;
+        // 你需要根据你原来的列混淆规则分别合成T0~T3
+        // 下面是示例，需根据你的实际列混淆顺序调整
+        T0[i] = (tx << 24) | (x << 16) | (x << 8) | tx_x;
+        T1[i] = (tx_x << 24) | (tx << 16) | (x << 8) | x;
+        T2[i] = (x << 24) | (tx_x << 16) | (tx << 8) | x;
+        T3[i] = (x << 24) | (x << 16) | (tx_x << 8) | tx;
     }
 }
 
@@ -176,7 +137,8 @@ void build_table_aes(const uint8_t matrix_sbox_table[256], const uint8_t time_ta
 void generate_rcon(uint8_t rcon[round + 2]) {
     rcon[0] = 0x00;  // 占位
     uint8_t value = 0x01;
-    for (int i = 1; i <= round + 1; i++) {
+    int i;
+    for (i = 1; i <= round + 1; i++) {
         rcon[i] = value;
         value <<= 1;
         if (value & 0x100) {
@@ -191,44 +153,39 @@ void key_expansion(const uint8_t key[16], const uint8_t matrix_sbox_table[256], 
 
     // 拷贝初始密钥
     memcpy(round_keys[0], key, 16);
+    int r;
 
-    for (int r = 1; r <= round + 1; r++) {
-        uint8_t temp[4];
-
-        // Get last 4 bytes of previous round key
-        memcpy(temp, &round_keys[r - 1][12], 4);
-
-        // RotWord
-        uint8_t first = temp[0];
-        temp[0] = temp[1];
-        temp[1] = temp[2];
-        temp[2] = temp[3];
-        temp[3] = first;
-
-        // SubWord
-        temp[0] = matrix_sbox_table[temp[0]];
-        temp[1] = matrix_sbox_table[temp[1]];
-        temp[2] = matrix_sbox_table[temp[2]];
-        temp[3] = matrix_sbox_table[temp[3]];
-
-        // Add Rcon
-        temp[0] ^= rcon[r];
+    for (r = 1; r <= round + 1; r++) {
+        round_keys[r][0] = matrix_sbox_table[round_keys[r - 1][13]];
+        round_keys[r][1] = matrix_sbox_table[round_keys[r - 1][14]];
+        round_keys[r][2] = matrix_sbox_table[round_keys[r - 1][15]];
+        round_keys[r][3] = matrix_sbox_table[round_keys[r - 1][12]];
+        round_keys[r][0] ^= rcon[r];
 
         // Generate first 4 bytes
-        round_keys[r][0] = round_keys[r - 1][0] ^ temp[0];
-        round_keys[r][1] = round_keys[r - 1][1] ^ temp[1];
-        round_keys[r][2] = round_keys[r - 1][2] ^ temp[2];
-        round_keys[r][3] = round_keys[r - 1][3] ^ temp[3];
+        round_keys[r][0] ^= round_keys[r - 1][0];
+        round_keys[r][1] ^= round_keys[r - 1][1];
+        round_keys[r][2] ^= round_keys[r - 1][2];
+        round_keys[r][3] ^= round_keys[r - 1][3];
 
         // Generate remaining 12 bytes
-        for (j = 4; j < 16; ++j) {
-            round_keys[r][j] = round_keys[r - 1][j] ^ round_keys[r][j - 4];
-        }
+        round_keys[r][4] = round_keys[r][0] ^ round_keys[r - 1][4];
+        round_keys[r][5] = round_keys[r][1] ^ round_keys[r - 1][5];
+        round_keys[r][6] = round_keys[r][2] ^ round_keys[r - 1][6];
+        round_keys[r][7] = round_keys[r][3] ^ round_keys[r - 1][7];
+        round_keys[r][8] = round_keys[r][4] ^ round_keys[r - 1][8];
+        round_keys[r][9] = round_keys[r][5] ^ round_keys[r - 1][9];
+        round_keys[r][10] = round_keys[r][6] ^ round_keys[r - 1][10];
+        round_keys[r][11] = round_keys[r][7] ^ round_keys[r - 1][11];
+        round_keys[r][12] = round_keys[r][8] ^ round_keys[r - 1][12];
+        round_keys[r][13] = round_keys[r][9] ^ round_keys[r - 1][13];
+        round_keys[r][14] = round_keys[r][10] ^ round_keys[r - 1][14];
+        round_keys[r][15] = round_keys[r][11] ^ round_keys[r - 1][15];
     }
 }
 
 // 加速splitmix64
-static uint64_t splitmix64(uint64_t* x) {
+static inline uint64_t splitmix64(uint64_t* x) {
     uint64_t z = (*x += 0x9e3779b97f4a7c15ULL);
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
     z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
@@ -265,104 +222,87 @@ uint64_t xoshiro256plusplus_next(xoshiro256plusplus_state* state) {
     return result;
 }
 
-// 生成随机明文结构
-void generate_pair(StatePair* pair, const uint8_t diff_bites[16], xoshiro256plusplus_state* prng) {
-    uint64_t r1 = xoshiro256plusplus_next(prng);
-    uint64_t r2 = xoshiro256plusplus_next(prng);
-    // 拆分成16字节
-    pair->first[0] = (r1 >> 0) & 0xFF;
-    pair->first[1] = (r1 >> 8) & 0xFF;
-    pair->first[2] = (r1 >> 16) & 0xFF;
-    pair->first[3] = (r1 >> 24) & 0xFF;
-    pair->first[4] = (r1 >> 32) & 0xFF;
-    pair->first[5] = (r1 >> 40) & 0xFF;
-    pair->first[6] = (r1 >> 48) & 0xFF;
-    pair->first[7] = (r1 >> 56) & 0xFF;
-    pair->first[8] = (r2 >> 0) & 0xFF;
-    pair->first[9] = (r2 >> 8) & 0xFF;
-    pair->first[10] = (r2 >> 16) & 0xFF;
-    pair->first[11] = (r2 >> 24) & 0xFF;
-    pair->first[12] = (r2 >> 32) & 0xFF;
-    pair->first[13] = (r2 >> 40) & 0xFF;
-    pair->first[14] = (r2 >> 48) & 0xFF;
-    pair->first[15] = (r2 >> 56) & 0xFF;
-
-    for (int k = 0; k < 16; ++k) {
-        pair->second[k] = pair->first[k] ^ diff_bites[k];
-    }
-}
-
 // round轮aes加密
-void encrypt(const uint8_t plaintext[16], State ciphertext, const KeySchedule key_schedule, const uint8_t aes_table[16][256], const uint8_t matrix_sbox_table[256], const int index[16]) {
-    memcpy(ciphertext, plaintext, STATE_SIZE);
-    // XOR with initial key
-    int i, j;
+// 假设State为uint8_t[16]，KeySchedule为uint8_t[rounds+2][16]
+void encrypt(const uint8_t plaintext[16], uint8_t ciphertext[16], const uint32_t key_schedule_32[round + 2][4], const KeySchedule key_schedule, const uint8_t matrix_sbox_table[256]) {
+    int i, r;
+    // 打包明文并加初始密钥
+    uint32_t* s = (uint32_t*)plaintext; // 直接在明文buffer上操作;
+    s[0] = __builtin_bswap32(s[0]);
+    s[1] = __builtin_bswap32(s[1]);
+    s[2] = __builtin_bswap32(s[2]);
+    s[3] = __builtin_bswap32(s[3]);
+	s[0] ^= key_schedule_32[0][0];
+    s[1] ^= key_schedule_32[0][1];
+    s[2] ^= key_schedule_32[0][2];
+    s[3] ^= key_schedule_32[0][3];
 
-    for (j = 0; j < 16; ++j) {
-        ciphertext[j] ^= key_schedule[0][j];
+    uint32_t t[4];
+    for (int r = 1; r < round + 1; ++r) {
+        t[0] = T0[(s[0] >> 24) & 0xFF] ^ T1[(s[1] >> 16) & 0xFF] ^ T2[(s[2] >> 8) & 0xFF] ^ T3[s[3] & 0xFF] ^ key_schedule_32[r][0];
+        t[1] = T0[(s[1] >> 24) & 0xFF] ^ T1[(s[2] >> 16) & 0xFF] ^ T2[(s[3] >> 8) & 0xFF] ^ T3[s[0] & 0xFF] ^ key_schedule_32[r][1];
+        t[2] = T0[(s[2] >> 24) & 0xFF] ^ T1[(s[3] >> 16) & 0xFF] ^ T2[(s[0] >> 8) & 0xFF] ^ T3[s[1] & 0xFF] ^ key_schedule_32[r][2];
+        t[3] = T0[(s[3] >> 24) & 0xFF] ^ T1[(s[0] >> 16) & 0xFF] ^ T2[(s[1] >> 8) & 0xFF] ^ T3[s[2] & 0xFF] ^ key_schedule_32[r][3];
+        // 直接写回明文buffer
+        s[0] = t[0];
+        s[1] = t[1];
+        s[2] = t[2];
+        s[3] = t[3];
     }
-
-    // Perform AES rounds
-    for (int r = 0; r < round; ++r) {
-        State c_temp;
-        memcpy(c_temp, ciphertext, STATE_SIZE);
-
-        AES_TABLE_ROW(0, 0, 4, 8, 12, 0, 5, 10, 15);
-        AES_TABLE_ROW(1, 1, 5, 9, 13, 0, 5, 10, 15);
-        AES_TABLE_ROW(2, 2, 6, 10, 14, 0, 5, 10, 15);
-        AES_TABLE_ROW(3, 3, 7, 11, 15, 0, 5, 10, 15);
-        AES_TABLE_ROW(4, 0, 4, 8, 12, 4, 9, 14, 3);
-        AES_TABLE_ROW(5, 1, 5, 9, 13, 4, 9, 14, 3);
-        AES_TABLE_ROW(6, 2, 6, 10, 14, 4, 9, 14, 3);
-        AES_TABLE_ROW(7, 3, 7, 11, 15, 4, 9, 14, 3);
-        AES_TABLE_ROW(8, 0, 4, 8, 12, 8, 13, 2, 7);
-        AES_TABLE_ROW(9, 1, 5, 9, 13, 8, 13, 2, 7);
-        AES_TABLE_ROW(10, 2, 6, 10, 14, 8, 13, 2, 7);
-        AES_TABLE_ROW(11, 3, 7, 11, 15, 8, 13, 2, 7);
-        AES_TABLE_ROW(12, 0, 4, 8, 12, 12, 1, 6, 11);
-        AES_TABLE_ROW(13, 1, 5, 9, 13, 12, 1, 6, 11);
-        AES_TABLE_ROW(14, 2, 6, 10, 14, 12, 1, 6, 11);
-        AES_TABLE_ROW(15, 3, 7, 11, 15, 12, 1, 6, 11);
-
-        for (j = 0; j < 16; ++j) {
-            ciphertext[j] ^= key_schedule[r + 1][j];
-        }
-    }
-
-    // Final round
-    uint8_t temp[16];
-    for (i = 0; i < 16; ++i) {
-        temp[i] = ciphertext[index[i]];
-    }
-    for (i = 0; i < 16; ++i) {
-        ciphertext[i] = matrix_sbox_table[temp[i]];
-    }
-    for (j = 0; j < 16; ++j) {
-        ciphertext[j] ^= key_schedule[round + 1][j];
-    }
+    // 最后一轮（ShiftRows+S盒+加密钥）
+    // 行移位
+    uint8_t tmp[16];
+    tmp[row_idx_inv[0]] = (s[0] >> 24) & 0xFF;
+    tmp[row_idx_inv[1]] = (s[0] >> 16) & 0xFF;
+    tmp[row_idx_inv[2]] = (s[0] >> 8) & 0xFF;
+    tmp[row_idx_inv[3]] = s[0] & 0xFF;
+    tmp[row_idx_inv[4]] = (s[1] >> 24) & 0xFF;
+    tmp[row_idx_inv[5]] = (s[1] >> 16) & 0xFF;
+    tmp[row_idx_inv[6]] = (s[1] >> 8) & 0xFF;
+    tmp[row_idx_inv[7]] = s[1] & 0xFF;
+    tmp[row_idx_inv[8]] = (s[2] >> 24) & 0xFF;
+    tmp[row_idx_inv[9]] = (s[2] >> 16) & 0xFF;
+    tmp[row_idx_inv[10]] = (s[2] >> 8) & 0xFF;
+    tmp[row_idx_inv[11]] = s[2] & 0xFF;
+    tmp[row_idx_inv[12]] = (s[3] >> 24) & 0xFF;
+    tmp[row_idx_inv[13]] = (s[3] >> 16) & 0xFF;
+    tmp[row_idx_inv[14]] = (s[3] >> 8) & 0xFF;
+    tmp[row_idx_inv[15]] = s[3] & 0xFF;
+    
+    // S盒+加密钥
+    ciphertext[0] = matrix_sbox_table[tmp[0]] ^ key_schedule[round + 1][0];
+    ciphertext[1] = matrix_sbox_table[tmp[1]] ^ key_schedule[round + 1][1];
+    ciphertext[2] = matrix_sbox_table[tmp[2]] ^ key_schedule[round + 1][2];
+    ciphertext[3] = matrix_sbox_table[tmp[3]] ^ key_schedule[round + 1][3];
+    ciphertext[4] = matrix_sbox_table[tmp[4]] ^ key_schedule[round + 1][4];
+    ciphertext[5] = matrix_sbox_table[tmp[5]] ^ key_schedule[round + 1][5];
+    ciphertext[6] = matrix_sbox_table[tmp[6]] ^ key_schedule[round + 1][6];
+    ciphertext[7] = matrix_sbox_table[tmp[7]] ^ key_schedule[round + 1][7];
+    ciphertext[8] = matrix_sbox_table[tmp[8]] ^ key_schedule[round + 1][8];
+    ciphertext[9] = matrix_sbox_table[tmp[9]] ^ key_schedule[round + 1][9];
+    ciphertext[10] = matrix_sbox_table[tmp[10]] ^ key_schedule[round + 1][10];
+    ciphertext[11] = matrix_sbox_table[tmp[11]] ^ key_schedule[round + 1][11];
+    ciphertext[12] = matrix_sbox_table[tmp[12]] ^ key_schedule[round + 1][12];
+    ciphertext[13] = matrix_sbox_table[tmp[13]] ^ key_schedule[round + 1][13];
+    ciphertext[14] = matrix_sbox_table[tmp[14]] ^ key_schedule[round + 1][14];
+    ciphertext[15] = matrix_sbox_table[tmp[15]] ^ key_schedule[round + 1][15];
 }
 
 // 判断一对加密后是否满足差分
-bool pass_filter(const uint8_t c1[16], const uint8_t c2[16], const uint8_t diff_output[16]) {
-    for (int i = 0; i < STATE_SIZE; ++i) {
-        if ((c1[i] ^ c2[i]) != diff_output[i]) return false;
-    }
-    return true;
+bool pass_filter(const uint8_t c1[16], const uint8_t c2[16], const uint64_t diff_output_64[2]) {
+    const uint64_t* a = (const uint64_t*)c1;
+    const uint64_t* b = (const uint64_t*)c2;
+    return ((a[0] ^ b[0]) == diff_output_64[0]) && ((a[1] ^ b[1]) == diff_output_64[1]);
 }
 
 // 单独将加密过程和筛选密文过程分离出来
-void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_bites[16], const KeySchedule key_schedule, const uint8_t aes_table[16][256], const uint8_t matrix_sbox_table[256], const uint8_t diff_output[16], const int index[16], StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count, uint64_t global_seed, int mpi_rank, int mpi_size) {
+void generate_encrypt_and_filter_stream(size_t total_pairs, const uint64_t diff_bites[2], const uint32_t key_schedule_32[round + 2][4], const KeySchedule key_schedule, const uint8_t matrix_sbox_table[256], const uint64_t diff_output_64[2], StatePair* batch, StatePair* filtered_pairs, size_t* filtered_count, size_t max_filtered_count, uint64_t global_seed, int mpi_rank, int mpi_size) {
     size_t i, j;
     // 1. 计算本进程需要处理的pair区间
     size_t pairs_per_rank = (total_pairs + mpi_size - 1) / mpi_size;
     size_t my_start = mpi_rank * pairs_per_rank;
     size_t my_end = my_start + pairs_per_rank;
     if (my_end > total_pairs) my_end = total_pairs;
-
-    // 2. 分配对齐的本地缓冲区
-    StatePair* batch = (StatePair*)aligned_alloc(64, BATCH_SIZE * sizeof(StatePair));
-    State* c1 = (State*)aligned_alloc(64, BATCH_SIZE * sizeof(State));
-    State* c2 = (State*)aligned_alloc(64, BATCH_SIZE * sizeof(State));
 
     // 用于记录本地筛选结果的计数器
     size_t local_count = 0;
@@ -371,35 +311,36 @@ void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_b
     xoshiro256plusplus_state prng;
     xoshiro256plusplus_init(&prng, global_seed, mpi_rank);
 
+    size_t batch_count;
+    uint64_t r1, r2;
+    int k;
     // 4. 主循环：批量生成、加密、筛选
     for (i = my_start; i < my_end; i += BATCH_SIZE) {
-        size_t batch_count = (i + BATCH_SIZE > my_end) ? (my_end - i) : BATCH_SIZE;
+        batch_count = (i + BATCH_SIZE > my_end) ? (my_end - i) : BATCH_SIZE;
 
-        // 1. 批量生成明文对
+        // 4.1. 批量生成明文对
         for (j = 0; j < batch_count; ++j) {
             // 每次用prng生成128位明文
-            uint64_t r1 = xoshiro256plusplus_next(&prng);
-            uint64_t r2 = xoshiro256plusplus_next(&prng);
-            for (int k = 0; k < 8; ++k) {
-                batch[j].first[k] = (r1 >> (8 * k)) & 0xFF;
-                batch[j].first[k + 8] = (r2 >> (8 * k)) & 0xFF;
-                batch[j].second[k] = batch[j].first[k] ^ diff_bites[k];
-                batch[j].second[k + 8] = batch[j].first[k + 8] ^ diff_bites[k + 8];
-            }
+            *(uint64_t*)(batch[j].first) = xoshiro256plusplus_next(&prng);
+            *(uint64_t*)(batch[j].first + 8) = xoshiro256plusplus_next(&prng);
+
+            ((uint64_t*)batch[j].second)[0] = ((uint64_t*)batch[j].first)[0] ^ diff_bites[0];
+            ((uint64_t*)batch[j].second)[1] = ((uint64_t*)batch[j].first)[1] ^ diff_bites[1];
         }
 
-        // 2. 批量加密
+        // 4.2. 批量加密和过滤
         for (j = 0; j < batch_count; ++j) {
-            encrypt(batch[j].first, c1[j], key_schedule, aes_table, matrix_sbox_table, index);
-            encrypt(batch[j].second, c2[j], key_schedule, aes_table, matrix_sbox_table, index);
-        }
+            encrypt(batch[j].first, batch[j].first, key_schedule_32, key_schedule, matrix_sbox_table);
+            encrypt(batch[j].second, batch[j].second, key_schedule_32, key_schedule, matrix_sbox_table);
 
-        // 3. 批量过滤
-        for (j = 0; j < batch_count; ++j) {
-            if (pass_filter(c1[j], c2[j], diff_output)) {
+            if (pass_filter(batch[j].first, batch[j].second, diff_output_64)) {
                 if (local_count < max_filtered_count) {  // 使用传入的max_filtered_count
-                    memcpy(filtered_pairs[local_count].first, c1[j], STATE_SIZE);
-                    memcpy(filtered_pairs[local_count].second, c2[j], STATE_SIZE);
+                    // 代替两次 memcpy
+                    ((uint64_t*)filtered_pairs[local_count].first)[0] = ((uint64_t*)batch[j].first)[0];
+                    ((uint64_t*)filtered_pairs[local_count].first)[1] = ((uint64_t*)batch[j].first)[1];
+                    ((uint64_t*)filtered_pairs[local_count].second)[0] = ((uint64_t*)batch[j].second)[0];
+                    ((uint64_t*)filtered_pairs[local_count].second)[1] = ((uint64_t*)batch[j].second)[1];
+
                     local_count++;
                 }
             }
@@ -408,41 +349,37 @@ void generate_encrypt_and_filter_stream(size_t total_pairs, const uint8_t diff_b
 
     // 5. 返回筛选结果数量
     *filtered_count = local_count;
-
-    free(batch);
-    free(c1);
-    free(c2);
 }
 
 // 单独将猜测子密钥过程分离出来
-void guess_subkeys(const uint8_t matrix_sbox_table[256], const StatePair* pairs_cand, int pairs_cand_count, const uint8_t diff_output[16], const int index_diff_word[2], int* max_val, int* max_index_count, int* max_index) {
-    int i, j;
-    int index_inv[] = { 0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3 };
-    uint8_t diff_det1 = diff_output[index_inv[index_diff_word[0]]] ^ 1;
-    uint8_t diff_det2 = diff_output[index_inv[index_diff_word[1]]] ^ 1;
+void guess_subkeys(const uint8_t matrix_sbox_table[256], const StatePair* pairs_cand, int pairs_cand_count, const int index_diff_word[2], int* max_val, int* max_index_count, int* max_index) {
+    int i, j, num;
+    uint8_t diff_det1 = diff_output[row_idx_inv[index_diff_word[0]]] ^ 1;
+    uint8_t diff_det2 = diff_output[row_idx_inv[index_diff_word[1]]] ^ 1;
+    uint8_t key1, key2, ct1, ct2, ct3, ct4;
+    bool match;
 
     int* cand_key_match = (int*)calloc(1 << 16, sizeof(int));
 
     for (i = 0; i < (1 << 16); ++i) {
-        uint8_t key1 = i & 0xFF;
-        uint8_t key2 = (i >> 8) & 0xFF;
-        int num = 0;
+        key1 = i & 0xFF;
+        key2 = (i >> 8) & 0xFF;
+        num = 0;
 
         for (j = 0; j < pairs_cand_count; ++j) {
-            uint8_t ct1, ct2, ct3, ct4;
+            ct1, ct2, ct3, ct4;
 
-            ct1 = pairs_cand[j].first[index_inv[index_diff_word[0]]] ^ key1;
-            ct2 = pairs_cand[j].first[index_inv[index_diff_word[1]]] ^ key2;
-            ct3 = pairs_cand[j].second[index_inv[index_diff_word[0]]] ^ key1;
-            ct4 = pairs_cand[j].second[index_inv[index_diff_word[1]]] ^ key2;
-
+            ct1 = pairs_cand[j].first[row_idx_inv[index_diff_word[0]]] ^ key1;
+            ct2 = pairs_cand[j].first[row_idx_inv[index_diff_word[1]]] ^ key2;
+            ct3 = pairs_cand[j].second[row_idx_inv[index_diff_word[0]]] ^ key1;
+            ct4 = pairs_cand[j].second[row_idx_inv[index_diff_word[1]]] ^ key2;
 
             ct1 = matrix_sbox_table[ct1];
             ct2 = matrix_sbox_table[ct2];
             ct3 = matrix_sbox_table[ct3];
             ct4 = matrix_sbox_table[ct4];
 
-            bool match = true;
+            match = true;
             if ((ct1 ^ ct3) != diff_det1) match = false;
             if ((ct2 ^ ct4) != diff_det2) match = false;
 
@@ -463,13 +400,14 @@ void guess_subkeys(const uint8_t matrix_sbox_table[256], const StatePair* pairs_
         }
     }
 
+	uint8_t cand_key1, cand_key2;
     printf("Maximum element: %d\n", *max_val);
     printf("Maximum index count: %d\n", *max_index_count);
     for (i = 0; i < *max_index_count; ++i) {
         printf("Index of maximum element: %d\n", max_index[i]);
 
-        uint8_t cand_key1 = max_index[i] & 0xFF;
-        uint8_t cand_key2 = (max_index[i] >> 8) & 0xFF;
+        cand_key1 = max_index[i] & 0xFF;
+        cand_key2 = (max_index[i] >> 8) & 0xFF;
         printf("Candidate key1: 0x%02X, Candidate key2: 0x%02X\n", cand_key1, cand_key2);
     }
 
@@ -489,13 +427,15 @@ int main(int argc, char* argv[]) {
     // 1. 初始化变量和数据结构
     int i, j;
     srand((unsigned int)time(NULL));
-    int index[] = { 0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11 };
-    int index_inv[] = { 0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3 };
     State diff_sol = { 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4f, 0x00, 0x00, 0x00, 0x00, 0x00 };
     State diff_plain = { 0x26, 0x00, 0xf7, 0x00, 0x00, 0x9f, 0x00, 0x01, 0x26, 0x00, 0xf7, 0x00, 0x00, 0x9f, 0x00, 0x01 };
+    uint64_t diff_plain_64[2];
+    memcpy(diff_plain_64, diff_plain, 16);
     State diff_word = { 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0 };
     uint8_t matrix_sol[] = { 0x97, 0x92, 0x94, 0x98, 0x10, 0x20, 0x40, 0x80 };
     uint64_t global_seed = 0xC7E6A3B2F19D4E58ULL; // 全局种子，用于xoshiro256plusplus初始化
+    uint64_t diff_output_64[2]; // 用于64位比较
+    memcpy(diff_output_64, diff_output, 16);
 
     // 2. 构建查找表
     uint8_t matrix_sol_table[256] = { 0 };
@@ -504,21 +444,27 @@ int main(int argc, char* argv[]) {
     build_lookup_tables(matrix_sol, matrix_sol_table, matrix_sbox_table, xtime_table);
 
     uint8_t aes_table[16][256] = { { 0x00 } };
-    build_table_aes(matrix_sbox_table, xtime_table, aes_table);
-
-    // 3. 计算 diff_output
-    State diff_output;
-    compute_diff_output(diff_word, diff_sol, matrix_sol_table, index, diff_output);
-    print_state(diff_output);
+    build_table_aes(matrix_sbox_table, xtime_table);
+    
+    if (rank == 0) {
+        print_state(diff_output);
+    }
 
     // 4. 生成主密钥以及密钥拓展
     // 生成轮常数rcon
     uint8_t rcon[round + 2];
     generate_rcon(rcon);
 
-    uint8_t key[] = { 0x3F, 0xA9, 0x72, 0x5C, 0x01, 0xBD, 0xE2, 0x9F, 0x56, 0x11, 0x3A, 0xC4, 0xD8, 0x77, 0x99, 0xAB };
+    uint8_t key[16] = { 0x3F, 0xA9, 0x72, 0x5C, 0x01, 0xBD, 0xE2, 0x9F, 0x56, 0x11, 0x3A, 0xC4, 0xD8, 0x77, 0x99, 0xAB };
     KeySchedule key_schedule;
     key_expansion(key, matrix_sbox_table, rcon, key_schedule);
+    uint32_t key_schedule_32[round + 2][4];
+    for (i = 0; i < round + 2; ++i) {
+		key_schedule_32[i][0] = (key_schedule[i][0] << 24) | (key_schedule[i][1] << 16) | (key_schedule[i][2] << 8) | key_schedule[i][3];
+		key_schedule_32[i][1] = (key_schedule[i][4] << 24) | (key_schedule[i][5] << 16) | (key_schedule[i][6] << 8) | key_schedule[i][7];
+        key_schedule_32[i][2] = (key_schedule[i][8] << 24) | (key_schedule[i][9] << 16) | (key_schedule[i][10] << 8) | key_schedule[i][11];
+        key_schedule_32[i][3] = (key_schedule[i][12] << 24) | (key_schedule[i][13] << 16) | (key_schedule[i][14] << 8) | key_schedule[i][15];
+    }
 
     // 5. 各进程独立生成、加密、筛选
     // 创建MPI派生类型
@@ -532,7 +478,10 @@ int main(int argc, char* argv[]) {
     StatePair* local_pairs = malloc(MAX_FILTERED_PAIRS * sizeof(StatePair));
     size_t local_count = 0;
 
-    generate_encrypt_and_filter_stream(MAX_PAIRS, diff_plain, key_schedule, aes_table, matrix_sbox_table, diff_output, index, local_pairs, &local_count, MAX_FILTERED_PAIRS, global_seed, rank, size);
+    // 2. 分配对齐的本地缓冲区
+    StatePair* batch = (StatePair*)aligned_alloc(64, BATCH_SIZE * sizeof(StatePair));
+
+    generate_encrypt_and_filter_stream(MAX_PAIRS, diff_plain_64, key_schedule_32, key_schedule, matrix_sbox_table, diff_output_64, batch, local_pairs, &local_count, MAX_FILTERED_PAIRS, global_seed, rank, size);
 
     MPI_Barrier(MPI_COMM_WORLD); // 所有进程结束主计算
     double t_end = MPI_Wtime();
@@ -594,7 +543,7 @@ int main(int argc, char* argv[]) {
         int max_index[1 << 16];
         int max_index_count = 0;
 
-        guess_subkeys(matrix_sbox_table, all_pairs, (int)total_count, diff_output, index_diff_word, &max_val, &max_index_count, max_index);
+        guess_subkeys(matrix_sbox_table, all_pairs, (int)total_count, index_diff_word, &max_val, &max_index_count, max_index);
 
         // 8. 导出全部候选子密钥
         FILE* fp = fopen("cand_key_0.txt", "w");   // 打开文件，"w" 表示写入模式
@@ -610,6 +559,7 @@ int main(int argc, char* argv[]) {
 
     // 清理内存
     free(local_pairs);
+    free(batch);
     if (rank == 0) {
         free(recv_counts);
         free(displs);
